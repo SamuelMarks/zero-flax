@@ -1,3 +1,4 @@
+from __future__ import annotations
 from zero_flax.nnx.module import Module
 from typing import (
     Any,
@@ -69,48 +70,9 @@ class variables:
         pass
 
 
-class chex:
-    class Array:
-        pass
-
-    class Numeric:
-        pass
-
-    class Scalar:
-        pass
-
-
-class core:
-    class Shape:
-        pass
-
-
-class optax:
-    class _src:
-        class base:
-            class GradientTransformationExtraArgs:
-                pass
-
-
-class base:
-    class GradientTransformation:
-        pass
-
-    class Schedule:
-        pass
-
-
-class jax:
-    class Array:
-        pass
-
-    class Device:
-        pass
-
-    class _src:
-        class typing:
-            class SupportsDType:
-                pass
+import zero_chex as chex
+import zero_optax as optax
+import zero_jax as jax
 
 
 M = Any

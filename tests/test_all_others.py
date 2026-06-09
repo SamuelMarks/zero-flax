@@ -1,6 +1,6 @@
 from zero_flax.nnx.state import Variable, Param, BatchStat, Rng, State, merge
 from zero_flax.nnx.module import Module
-from zero_flax.nnx.initializers import zeros, ones, glorot_uniform, he_normal
+from zero_jax.nn.initializers import zeros, ones, glorot_uniform, he_normal
 from zero_flax.nnx import (
     Dense,
     LayerNorm,
@@ -45,8 +45,8 @@ def test_initializers():
     shape = (2, 2)
     zeros(rng, shape)
     ones(rng, shape)
-    glorot_uniform(rng, shape)
-    he_normal(rng, shape)
+    glorot_uniform()(rng, shape)
+    he_normal()(rng, shape)
 
 
 def test_layers():

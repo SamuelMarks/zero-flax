@@ -11,7 +11,7 @@ class Dense(Module):
         in_features: int,
         out_features: int,
         use_bias: bool = True,
-        kernel_init: Callable = initializers.glorot_uniform,
+        kernel_init: Callable = initializers.glorot_uniform(),
         bias_init: Callable = initializers.zeros,
         rngs: Any = None,
         *args,

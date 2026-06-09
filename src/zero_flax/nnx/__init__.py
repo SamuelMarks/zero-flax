@@ -76,48 +76,9 @@ class variables:
         pass
 
 
-class chex:
-    class Array:
-        pass
-
-    class Numeric:
-        pass
-
-    class Scalar:
-        pass
-
-
-class core:
-    class Shape:
-        pass
-
-
-class optax:
-    class _src:
-        class base:
-            class GradientTransformationExtraArgs:
-                pass
-
-
-class base:
-    class GradientTransformation:
-        pass
-
-    class Schedule:
-        pass
-
-
-class jax:
-    class Array:
-        pass
-
-    class Device:
-        pass
-
-    class _src:
-        class typing:
-            class SupportsDType:
-                pass
+import zero_chex as chex
+import zero_optax as optax
+import zero_jax as jax
 
 
 M = tp.TypeVar("M")
@@ -136,8 +97,8 @@ dot_product_attention = None
 
 from .state import Variable, Param, BatchStat, Rng, State, merge  # noqa
 from .module import Module  # noqa
-from . import initializers  # noqa
-from .initializers import zeros, ones, glorot_uniform, he_normal  # noqa
+from zero_jax.nn import initializers  # noqa
+from zero_jax.nn.initializers import zeros, ones, glorot_uniform, he_normal  # noqa
 
 
 from .containers import Dict as Dict, List as List, Sequential as Sequential  # noqa: E402

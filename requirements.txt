@@ -1,0 +1,6 @@
+numpy
+zero-jax @ git+https://github.com/SamuelMarks/zero-jax.git@master
+zero-chex @ git+https://github.com/SamuelMarks/zero-chex.git@master
+zero-optax @ git+https://github.com/SamuelMarks/zero-optax.git@master
+zero-orbax @ git+https://github.com/SamuelMarks/zero-orbax.git@master
+zero-grain @ git+https://github.com/SamuelMarks/zero-grain.git@master
