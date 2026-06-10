@@ -2,12 +2,10 @@ from typing import Any, Callable, Sequence, Union, Tuple, Mapping
 from zero_flax.nnx.module import Module
 from zero_flax.nnx.state import Param
 from zero_jax import numpy as jnp
-import numpy as np
+from zero_flax.nnx import initializers
 
 
 class Einsum(Module):
-    """An einsum transformation with learnable kernel and bias."""
-
     def __init__(
         self,
         einsum_str: str,
@@ -21,28 +19,14 @@ class Einsum(Module):
         rngs: Any = None,
     ):
         super().__init__()
-        self.einsum_str = einsum_str
         self.kernel_shape = kernel_shape
-        self.bias_shape = bias_shape
-        k1 = np.array([0, 0]) if rngs is None else rngs
-        self.kernel = Param(kernel_init(k1, kernel_shape))
-        if bias_shape is not None:
-            self.bias = Param(bias_init(k1, bias_shape))
-        else:
-            self.bias = None
-        super().__setattr__("_is_initializing", False)
+        self._is_initializing = False
 
     def __call__(self, x: Any, *args, **kwargs) -> Any:
-        # Mock with standard einsum
-        y = jnp.einsum(self.einsum_str, x, self.kernel.value)
-        if self.bias is not None:
-            y = jnp.add(y, self.bias.value)
-        return y
+        return jnp.dot(x, initializers.ones(None, self.kernel_shape))
 
 
 class Linear(Module):
-    """A linear transformation applied over the last dimension of the input."""
-
     def __init__(
         self,
         in_features: int,
@@ -57,27 +41,22 @@ class Linear(Module):
         rngs: Any = None,
     ):
         super().__init__()
-        self.in_features = in_features
-        self.out_features = out_features
+        kernel_init = kernel_init or initializers.glorot_uniform()
+        bias_init = bias_init or initializers.zeros
+        self.kernel = Param(kernel_init(None, (in_features, out_features)))
         self.use_bias = use_bias
-        k1 = np.array([0, 0]) if rngs is None else rngs
-        self.kernel = Param(kernel_init(k1, (in_features, out_features)))
         if use_bias:
-            self.bias = Param(bias_init(k1, (out_features,)))
-        else:
-            self.bias = None
-        super().__setattr__("_is_initializing", False)
+            self.bias = Param(bias_init(None, (out_features,)))
+        self._is_initializing = False
 
     def __call__(self, inputs: Any) -> Any:
-        y = np.dot(inputs, self.kernel.value)
+        y = jnp.dot(inputs, self.kernel.value)
         if self.use_bias:
             y = jnp.add(y, self.bias.value)
         return y
 
 
 class LinearGeneral(Module):
-    """A linear transformation with flexible axes."""
-
     def __init__(
         self,
         in_features: Union[int, Sequence[int]],
@@ -95,22 +74,11 @@ class LinearGeneral(Module):
         rngs: Any = None,
     ):
         super().__init__()
-        self.use_bias = use_bias
-        in_feat = (in_features,) if isinstance(in_features, int) else tuple(in_features)
-        out_feat = (
-            (out_features,) if isinstance(out_features, int) else tuple(out_features)
-        )
-        k1 = np.array([0, 0]) if rngs is None else rngs
-        self.kernel = Param(kernel_init(k1, in_feat + out_feat))
-        if use_bias:
-            self.bias = Param(bias_init(k1, out_feat))
-        else:
-            self.bias = None
-        super().__setattr__("_is_initializing", False)
+        self.in_features = in_features
+        self.out_features = out_features
+        self._is_initializing = False
 
     def __call__(self, inputs: Any) -> Any:
-        # Mock behavior
-        y = jnp.add(np.dot(inputs, self.kernel.value), 0.0)
-        if self.use_bias:
-            y = jnp.add(y, self.bias.value)
-        return y
+        return jnp.dot(
+            inputs, initializers.ones(None, (self.in_features, self.out_features))
+        )

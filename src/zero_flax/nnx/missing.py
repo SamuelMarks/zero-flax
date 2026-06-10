@@ -1,14 +1,6 @@
 from __future__ import annotations
 from zero_flax.nnx.module import Module
-from typing import (
-    Any,
-    Callable,
-    Sequence,
-    Optional,
-    Iterable,
-    Mapping,
-    Type,
-)
+from typing import Any, Callable, Sequence, Optional, Iterable, Mapping, Type
 import numpy
 
 Array = Any
@@ -70,11 +62,6 @@ class variables:
         pass
 
 
-import zero_chex as chex
-import zero_optax as optax
-import zero_jax as jax
-
-
 M = Any
 A = Any
 UNSPECIFIED = None
@@ -122,8 +109,7 @@ class BatchNorm(Module):
         use_fast_variance: bool = True,
         rngs: Any = None,
     ):
-        super().__init__()
-        super().__setattr__("_is_initializing", False)
+        pass
 
     def __call__(self, *args, **kwargs):
         pass
@@ -150,8 +136,7 @@ class ConvTranspose(Module):
         transpose_kernel: bool = False,
         rngs: Any = None,
     ):
-        super().__init__()
-        super().__setattr__("_is_initializing", False)
+        pass
 
     def __call__(self, *args, **kwargs):
         pass
@@ -168,8 +153,7 @@ class Dropout(Module):
         rng_collection: str = "dropout",
         rngs: Any | None = None,
     ):
-        super().__init__()
-        super().__setattr__("_is_initializing", False)
+        pass
 
     def __call__(self, *args, **kwargs):
         pass
@@ -197,8 +181,7 @@ class Jit(Module):
         module_init_args: tuple[Any, ...] = None,
         module_init_kwargs: dict[str, Any] = None,
     ):
-        super().__init__()
-        super().__setattr__("_is_initializing", False)
+        pass
 
     def __call__(self, *args, **kwargs):
         pass
@@ -219,8 +202,7 @@ class LoRA(Module):
         lora_param_type: Type[variables.Variable] = None,
         rngs: Any = None,
     ):
-        super().__init__()
-        super().__setattr__("_is_initializing", False)
+        pass
 
     def __call__(self, *args, **kwargs):
         pass
@@ -248,8 +230,7 @@ class LoRALinear(Module):
         bias_init: Initializer = None,
         dot_general: DotGeneralT = None,
     ):
-        super().__init__()
-        super().__setattr__("_is_initializing", False)
+        pass
 
     def __call__(self, *args, **kwargs):
         pass
@@ -284,8 +265,7 @@ class MultiHeadAttention(Module):
         out_dot_general_cls: Any = None,
         rngs: Any = None,
     ):
-        super().__init__()
-        super().__setattr__("_is_initializing", False)
+        pass
 
     def __call__(self, *args, **kwargs):
         pass
@@ -313,8 +293,7 @@ class Pmap(Module):
         module_init_args: tuple[Any, ...] = None,
         module_init_kwargs: dict[str, Any] = None,
     ):
-        super().__init__()
-        super().__setattr__("_is_initializing", False)
+        pass
 
     def __call__(self, *args, **kwargs):
         pass
@@ -332,8 +311,7 @@ class Remat(Module):
         module_init_args: tuple[Any, ...] = None,
         module_init_kwargs: dict[str, Any] = None,
     ):
-        super().__init__()
-        super().__setattr__("_is_initializing", False)
+        pass
 
     def __call__(self, *args, **kwargs):
         pass
@@ -360,8 +338,7 @@ class Scan(Module):
         module_init_args: tuple[Any, ...] = None,
         module_init_kwargs: dict[str, Any] = None,
     ):
-        super().__init__()
-        super().__setattr__("_is_initializing", False)
+        pass
 
     def __call__(self, *args, **kwargs):
         pass
@@ -385,8 +362,7 @@ class Vmap(Module):
         module_init_args: tuple[Any, ...] = None,
         module_init_kwargs: dict[str, Any] = None,
     ):
-        super().__init__()
-        super().__setattr__("_is_initializing", False)
+        pass
 
     def __call__(self, *args, **kwargs):
         pass

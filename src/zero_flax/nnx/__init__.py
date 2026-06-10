@@ -1,7 +1,7 @@
-# ruff: noqa: E402, F811
-from __future__ import annotations  # noqa
-import typing as tp  # noqa
-from typing import (  # noqa
+from __future__ import annotations
+import ml_switcheroo
+import typing as tp
+from typing import (
     Any,
     Callable,
     Sequence,
@@ -13,9 +13,9 @@ from typing import (  # noqa
     Literal,
     Type,
 )
-import collections.abc  # noqa
-import numpy  # noqa
-from zero_jax import numpy as jnp  # noqa
+import collections.abc
+import numpy
+from zero_jax import numpy as jnp
 
 Array = Any
 ArrayLike = Any
@@ -80,7 +80,6 @@ import zero_chex as chex
 import zero_optax as optax
 import zero_jax as jax
 
-
 M = tp.TypeVar("M")
 A = tp.TypeVar("A")
 UNSPECIFIED = None
@@ -94,24 +93,18 @@ KeyArray = Any
 RealNumeric = Any
 LoRAParam = Any
 dot_product_attention = None
-
-from .state import Variable, Param, BatchStat, Rng, State, merge  # noqa
-from .module import Module  # noqa
-from zero_jax.nn import initializers  # noqa
-from zero_jax.nn.initializers import zeros, ones, glorot_uniform, he_normal  # noqa
-
-
-from .containers import Dict as Dict, List as List, Sequential as Sequential  # noqa: E402
-
-from .linear import Einsum as Einsum, Linear as Linear, LinearGeneral as LinearGeneral  # noqa: F401, E402
-
+from .state import Variable, Param, BatchStat, Rng, State, merge
+from .module import Module
+from zero_jax.nn import initializers
+from zero_jax.nn.initializers import zeros, ones, glorot_uniform, he_normal
+from .containers import Dict as Dict, List as List, Sequential as Sequential
+from .linear import Einsum as Einsum, Linear as Linear, LinearGeneral as LinearGeneral
 from .normalization import (
     BatchNorm as BatchNorm,
     LayerNorm as LayerNorm,
     RMSNorm as RMSNorm,
-)  # noqa: F401, E402, F811
-
-from .stochastic import Dropout as Dropout  # noqa: F401, E402, F811
+)
+from .stochastic import Dropout as Dropout
 from .missing import (
     ConvTranspose as ConvTranspose,
     Jit as Jit,
@@ -122,10 +115,5 @@ from .missing import (
     Scan as Scan,
     Vmap as Vmap,
     MultiHeadAttention as MultiHeadAttention,
-)  # noqa: F401, E402, F811
-
-from .layers import (
-    Dense as Dense,
-    Conv as Conv,
-    Embed as Embed,
-)  # noqa: F401, E402
+)
+from .layers import Dense as Dense, Conv as Conv, Embed as Embed

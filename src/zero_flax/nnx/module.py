@@ -1,43 +1,50 @@
 """Module system for nnx."""
 
-from typing import Any  # noqa: F401
-from zero_flax.nnx.state import Variable, State  # noqa: F401
+from typing import Any
+from zero_flax.nnx.state import Variable, State
 
 
 class Module:
-    """Base class for nnx Modules."""
-
     def __init__(self):
         super().__setattr__("_is_initializing", True)
+        super().__setattr__("_children", {})
+        super().__setattr__("_variables", {})
 
     def __setattr__(self, name: str, value: Any):
-        if getattr(self, "_is_initializing", False) or isinstance(
-            value, (Variable, Module)
-        ):
+        if name in ["_is_initializing", "_children", "_variables"]:
             super().__setattr__(name, value)
-        else:
-            raise ValueError(
-                f"Cannot mutate non-Variable attribute '{name}' after initialization."
-            )
+            return
+
+        if not getattr(self, "_is_initializing", True):
+            if not hasattr(self, name):
+                raise ValueError(
+                    f"Cannot add new attribute {name} after initialization"
+                )
+
+        if isinstance(value, Module):
+            if not hasattr(self, "_children"):
+                super().__setattr__("_children", {})
+            self._children[name] = value
+        elif isinstance(value, Variable):
+            if not hasattr(self, "_variables"):
+                super().__setattr__("_variables", {})
+            self._variables[name] = value
+
+        super().__setattr__(name, value)
 
     def state(self) -> State:
-        """Extracts the state of the module."""
-        state = State()
-        for name, value in self.__dict__.items():
-            if name.startswith("_"):
-                continue
-            if isinstance(value, Variable):
-                state[name] = value
-            elif isinstance(value, Module):
-                state[name] = value.state()
-        return state
+        s = State()
+        if hasattr(self, "_variables"):
+            for k, v in self._variables.items():
+                s[k] = v
+        if hasattr(self, "_children"):
+            for k, child in self._children.items():
+                s[k] = child.state()
+        return s
 
     def update(self, state: State):
-        """Updates the module's state from a State object."""
-        for name, value in state.items():
-            if hasattr(self, name):
-                attr = getattr(self, name)
-                if isinstance(attr, Variable):
-                    attr.value = value.value
-                elif isinstance(attr, Module):
-                    attr.update(value)
+        for k, v in state.items():
+            if hasattr(self, "_children") and k in self._children:
+                self._children[k].update(v)
+            elif hasattr(self, "_variables") and k in self._variables:
+                self._variables[k].value = v.value
