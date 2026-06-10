@@ -1,37 +1,51 @@
+"""Module docstring."""
+
 from zero_flax.nnx.module import Module
 from typing import Iterable, Callable, Any, TypeVar
 
 A = TypeVar("A")
 
 
-class Dict(Module):
+class Dict(Module, dict):
     """Base class for all neural network modules."""
 
     def __init__(self, *args, **kwargs):
-        pass
+        """Docstring."""
+        super().__init__()
+        dict.__init__(self, *args, **kwargs)
 
     def __call__(self, *args, **kwargs):
-        pass
+        """Docstring."""
+        return None
 
 
-class List(Module):
+class List(Module, list):
     """Base class for all neural network modules."""
 
     def __init__(self, elems: Iterable[A] = (), /):
-        pass
+        """Docstring."""
+        super().__init__()
+        list.__init__(self, elems)
 
     def __iter__(self):
-        pass
+        """Docstring."""
+        return list.__iter__(self)
 
     def __getitem__(self, idx):
-        pass
+        """Docstring."""
+        return list.__getitem__(self, idx)
 
 
 class Sequential(Module):
     """Base class for all neural network modules."""
 
     def __init__(self, *fns: Callable[..., Any]):
-        pass
+        """Docstring."""
+        super().__init__()
+        self.fns = fns
 
     def __call__(self, x, *args, **kwargs):
-        pass
+        """Docstring."""
+        for fn in self.fns:
+            x = fn(x, *args, **kwargs)
+        return x

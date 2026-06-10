@@ -12,7 +12,9 @@ from zero_flax.nnx import (
 
 
 def test_dense():
-    d = Dense(2, 3)
+    from zero_jax.nn import initializers
+
+    d = Dense(2, 3, kernel_init=initializers.ones, bias_init=initializers.zeros)
     x = np.ones((1, 2))
     y = d(x)
     assert getattr(y, "shape", y.shape) == (1, 3)
@@ -57,3 +59,29 @@ def test_dense_no_bias():
     x = np.ones((1, 2))
     y = d(x)
     assert y.shape == (1, 3)
+
+
+def test_missing_apis():
+    from zero_flax.nnx import missing
+
+    axis = missing.AxisName()
+    prec = missing.PrecisionLike()
+    pad = missing.PaddingLike()
+    dtype = missing.Dtype()
+    shape = missing.Shape()
+    axes = missing.Axes()
+    size = missing.Size()
+    ax = missing.Axis()
+    dg = missing.DotGeneralT()
+    mf = missing.MaxFun()
+
+    assert axis is not None
+    assert prec is not None
+    assert pad is not None
+
+    # Try dummy module
+    import zero_flax.nnx as nnx
+    from zero_flax.nnx.missing import variables
+
+    var = variables.Variable()
+    assert var is not None

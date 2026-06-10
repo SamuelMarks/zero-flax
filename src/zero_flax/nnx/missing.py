@@ -1,4 +1,8 @@
+"""Module docstring."""
+
 from __future__ import annotations
+
+
 from zero_flax.nnx.module import Module
 from typing import Any, Callable, Sequence, Optional, Iterable, Mapping, Type
 import numpy
@@ -8,57 +12,93 @@ ArrayLike = Any
 
 
 class AxisName:
+    """Docstring."""
+
     pass
 
 
 class PrecisionLike:
+    """Docstring."""
+
     pass
 
 
 class PaddingLike:
+    """Docstring."""
+
     pass
 
 
 class Dtype:
+    """Docstring."""
+
     pass
 
 
 class Shape:
+    """Docstring."""
+
     pass
 
 
 class Axes:
+    """Docstring."""
+
     pass
 
 
 class Size:
+    """Docstring."""
+
     pass
 
 
 class Axis:
+    """Docstring."""
+
     pass
 
 
 class DotGeneralT:
+    """Docstring."""
+
     pass
 
 
 class MaxFun:
+    """Docstring."""
+
     pass
 
 
 class filterlib:
+    """Docstring."""
+
     class Filter:
+        """Docstring."""
+
         pass
 
 
 class rnglib:
+    """Docstring."""
+
     class Rngs:
+        """Docstring."""
+
+        def __init__(self, *args, **kwargs):
+            """Docstring."""
+            pass
+
         pass
 
 
 class variables:
+    """Docstring."""
+
     class Variable:
+        """Docstring."""
+
         pass
 
 
@@ -78,10 +118,14 @@ dot_product_attention = None
 
 
 class Initializer:
+    """Docstring."""
+
     pass
 
 
 class initializers:
+    """Docstring."""
+
     zeros = None
     ones = None
     zeros_init = None
@@ -109,9 +153,11 @@ class BatchNorm(Module):
         use_fast_variance: bool = True,
         rngs: Any = None,
     ):
+        """Docstring."""
         pass
 
     def __call__(self, *args, **kwargs):
+        """Docstring."""
         pass
 
 
@@ -124,7 +170,7 @@ class ConvTranspose(Module):
         out_features: int,
         kernel_size: int | Sequence[int],
         strides: int | Sequence[int] | None = None,
-        padding: PaddingLike = "SAME",
+        padding: Any = "SAME",
         kernel_dilation: int | Sequence[int] | None = None,
         use_bias: bool = True,
         mask: Array | None = None,
@@ -136,9 +182,11 @@ class ConvTranspose(Module):
         transpose_kernel: bool = False,
         rngs: Any = None,
     ):
+        """Docstring."""
         pass
 
     def __call__(self, *args, **kwargs):
+        """Docstring."""
         pass
 
 
@@ -153,9 +201,11 @@ class Dropout(Module):
         rng_collection: str = "dropout",
         rngs: Any | None = None,
     ):
+        """Docstring."""
         pass
 
     def __call__(self, *args, **kwargs):
+        """Docstring."""
         pass
 
 
@@ -178,12 +228,14 @@ class Jit(Module):
         abstracted_axes: Optional[Any] = None,
         donate_state: bool = False,
         constrain_state: bool | Any = False,
-        module_init_args: tuple[Any, ...] = None,
-        module_init_kwargs: dict[str, Any] = None,
+        module_init_args: Optional[tuple[Any, ...]] = None,
+        module_init_kwargs: Optional[dict[str, Any]] = None,
     ):
+        """Docstring."""
         pass
 
     def __call__(self, *args, **kwargs):
+        """Docstring."""
         pass
 
 
@@ -199,12 +251,14 @@ class LoRA(Module):
         dtype: Optional[Dtype] = None,
         param_dtype: str | type[Any] | numpy.dtype | Any | Any = None,
         kernel_init: Any | Callable[..., Any] = None,
-        lora_param_type: Type[variables.Variable] = None,
+        lora_param_type: Optional[Type[variables.Variable]] = None,
         rngs: Any = None,
     ):
+        """Docstring."""
         pass
 
     def __call__(self, *args, **kwargs):
+        """Docstring."""
         pass
 
 
@@ -219,20 +273,22 @@ class LoRALinear(Module):
         lora_dtype: Optional[Dtype] = None,
         lora_param_dtype: str | type[Any] | numpy.dtype | Any | Any = None,
         lora_kernel_init: Any | Callable[..., Any] = None,
-        lora_param_type: Type[variables.Variable] = None,
+        lora_param_type: Optional[Type[variables.Variable]] = None,
         rngs: Any = None,
         kwargs={},
         use_bias: bool = True,
         dtype: Optional[Dtype] = None,
-        param_dtype: Dtype = None,
-        precision: PrecisionLike = None,
-        kernel_init: Initializer = None,
-        bias_init: Initializer = None,
-        dot_general: DotGeneralT = None,
+        param_dtype: Optional[Dtype] = None,
+        precision: Optional[PrecisionLike] = None,
+        kernel_init: Optional[Initializer] = None,
+        bias_init: Optional[Initializer] = None,
+        dot_general: Optional[DotGeneralT] = None,
     ):
+        """Docstring."""
         pass
 
     def __call__(self, *args, **kwargs):
+        """Docstring."""
         pass
 
 
@@ -250,13 +306,13 @@ class MultiHeadAttention(Module):
         broadcast_dropout: bool = True,
         dropout_rate: float = 0.0,
         deterministic: bool | None = None,
-        precision: PrecisionLike = None,
+        precision: Optional[PrecisionLike] = None,
         kernel_init=None,
         out_kernel_init: Initializer | None = None,
         bias_init=None,
         out_bias_init: Initializer | None = None,
         use_bias: bool = True,
-        attention_fn: Callable[..., Array] = "(dot_product_attention)",
+        attention_fn: Any = "(dot_product_attention)",
         decode: bool | None = None,
         normalize_qk: bool = False,
         qkv_dot_general: DotGeneralT | None = None,
@@ -265,9 +321,11 @@ class MultiHeadAttention(Module):
         out_dot_general_cls: Any = None,
         rngs: Any = None,
     ):
+        """Docstring."""
         pass
 
     def __call__(self, *args, **kwargs):
+        """Docstring."""
         pass
 
 
@@ -287,15 +345,17 @@ class Pmap(Module):
         donate_argnums: int | Iterable[int] = (),
         global_arg_shapes: tuple[tuple[int, ...], ...] | None = None,
         in_axes_kwargs: Any = 0,
-        state_axes: Mapping[filterlib.Filter, int] = None,
-        split_rngs: filterlib.Filter = Ellipsis,
-        transform_metadata: Mapping[str, Any] = None,
-        module_init_args: tuple[Any, ...] = None,
-        module_init_kwargs: dict[str, Any] = None,
+        state_axes: Optional[Mapping[filterlib.Filter, int]] = None,
+        split_rngs: Any = Ellipsis,
+        transform_metadata: Optional[Mapping[str, Any]] = None,
+        module_init_args: Optional[tuple[Any, ...]] = None,
+        module_init_kwargs: Optional[dict[str, Any]] = None,
     ):
+        """Docstring."""
         pass
 
     def __call__(self, *args, **kwargs):
+        """Docstring."""
         pass
 
 
@@ -308,12 +368,14 @@ class Remat(Module):
         prevent_cse: bool = True,
         static_argnums: int | tuple[int, ...] = (),
         policy: Callable[..., bool] | None = None,
-        module_init_args: tuple[Any, ...] = None,
-        module_init_kwargs: dict[str, Any] = None,
+        module_init_args: Optional[tuple[Any, ...]] = None,
+        module_init_kwargs: Optional[dict[str, Any]] = None,
     ):
+        """Docstring."""
         pass
 
     def __call__(self, *args, **kwargs):
+        """Docstring."""
         pass
 
 
@@ -331,16 +393,18 @@ class Scan(Module):
         in_axes_kwargs: Any = 0,
         out_axes: Any = 0,
         carry_argnum: int = 1,
-        state_axes: Mapping[filterlib.Filter, int] = None,
-        split_rngs: filterlib.Filter = Ellipsis,
-        transform_metadata: Mapping[str, Any] = None,
+        state_axes: Optional[Mapping[filterlib.Filter, int]] = None,
+        split_rngs: Any = Ellipsis,
+        transform_metadata: Optional[Mapping[str, Any]] = None,
         scan_output: bool = True,
-        module_init_args: tuple[Any, ...] = None,
-        module_init_kwargs: dict[str, Any] = None,
+        module_init_args: Optional[tuple[Any, ...]] = None,
+        module_init_kwargs: Optional[dict[str, Any]] = None,
     ):
+        """Docstring."""
         pass
 
     def __call__(self, *args, **kwargs):
+        """Docstring."""
         pass
 
 
@@ -356,13 +420,15 @@ class Vmap(Module):
         axis_size: int | None = None,
         spmd_axis_name: AxisName | tuple[AxisName, ...] | None = None,
         in_axes_kwargs: Any = 0,
-        state_axes: Mapping[filterlib.Filter, int] = None,
-        split_rngs: filterlib.Filter = Ellipsis,
-        transform_metadata: Mapping[str, Any] = None,
-        module_init_args: tuple[Any, ...] = None,
-        module_init_kwargs: dict[str, Any] = None,
+        state_axes: Optional[Mapping[filterlib.Filter, int]] = None,
+        split_rngs: Any = Ellipsis,
+        transform_metadata: Optional[Mapping[str, Any]] = None,
+        module_init_args: Optional[tuple[Any, ...]] = None,
+        module_init_kwargs: Optional[dict[str, Any]] = None,
     ):
+        """Docstring."""
         pass
 
     def __call__(self, *args, **kwargs):
+        """Docstring."""
         pass

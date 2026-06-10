@@ -30,3 +30,6 @@ ignore = ['E402', 'F401', 'F841', 'E741', 'E501']
 [tool.pytest.ini_options]
 pythonpath = "src"
 addopts = "--cov=src --cov-fail-under=80"
+
+[tool.mypy]
+ignore_missing_imports = true

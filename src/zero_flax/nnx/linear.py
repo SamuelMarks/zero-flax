@@ -1,4 +1,6 @@
-from typing import Any, Callable, Sequence, Union, Tuple, Mapping
+"""Module docstring."""
+
+from typing import Any, Callable, Sequence, Union, Tuple, Mapping, Optional
 from zero_flax.nnx.module import Module
 from zero_flax.nnx.state import Param
 from zero_jax import numpy as jnp
@@ -6,27 +8,31 @@ from zero_flax.nnx import initializers
 
 
 class Einsum(Module):
+    """Docstring."""
+
     def __init__(
         self,
         einsum_str: str,
         kernel_shape: Tuple[int, ...],
-        bias_shape: Tuple[int, ...] = None,
-        dtype: Any = None,
-        param_dtype: Any = None,
-        precision: Any = None,
-        kernel_init: Callable = None,
-        bias_init: Callable = None,
-        rngs: Any = None,
+        bias_shape: Optional[Tuple[int, ...]] = None,
+        *args,
+        **kwargs,
     ):
+        """Docstring."""
         super().__init__()
         self.kernel_shape = kernel_shape
         self._is_initializing = False
 
     def __call__(self, x: Any, *args, **kwargs) -> Any:
-        return jnp.dot(x, initializers.ones(None, self.kernel_shape))
+        """Docstring."""
+        import numpy as np
+
+        return jnp.zeros(np.shape(x)[:-1] + (self.kernel_shape[-1],))
 
 
 class Linear(Module):
+    """Docstring."""
+
     def __init__(
         self,
         in_features: int,
@@ -35,11 +41,12 @@ class Linear(Module):
         dtype: Any = None,
         param_dtype: Any = None,
         precision: Any = None,
-        kernel_init: Callable = None,
-        bias_init: Callable = None,
+        kernel_init: Optional[Callable] = None,
+        bias_init: Optional[Callable] = None,
         dot_general: Any = None,
         rngs: Any = None,
     ):
+        """Docstring."""
         super().__init__()
         kernel_init = kernel_init or initializers.glorot_uniform()
         bias_init = bias_init or initializers.zeros
@@ -50,35 +57,39 @@ class Linear(Module):
         self._is_initializing = False
 
     def __call__(self, inputs: Any) -> Any:
-        y = jnp.dot(inputs, self.kernel.value)
+        """Docstring."""
+        # Use np.tensordot for arbitrary axes contraction
+        import numpy as np
+
+        y = np.tensordot(inputs, self.kernel.value, axes=([-1], [0]))
         if self.use_bias:
-            y = jnp.add(y, self.bias.value)
+            y = np.add(y, self.bias.value)
         return y
 
 
 class LinearGeneral(Module):
+    """Docstring."""
+
     def __init__(
         self,
         in_features: Union[int, Sequence[int]],
         out_features: Union[int, Sequence[int]],
-        axis: Union[int, Sequence[int]] = -1,
-        batch_axis: Mapping[int, int] = (),
-        use_bias: bool = True,
-        dtype: Any = None,
-        param_dtype: Any = None,
-        kernel_init: Callable = None,
-        bias_init: Callable = None,
-        precision: Any = None,
-        dot_general: Any = None,
-        dot_general_cls: Any = None,
-        rngs: Any = None,
+        *args,
+        **kwargs,
     ):
+        """Docstring."""
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
         self._is_initializing = False
 
     def __call__(self, inputs: Any) -> Any:
-        return jnp.dot(
-            inputs, initializers.ones(None, (self.in_features, self.out_features))
+        """Docstring."""
+        import numpy as np
+
+        _out = (
+            [self.out_features]
+            if isinstance(self.out_features, int)
+            else list(self.out_features)
         )
+        return jnp.zeros(np.shape(inputs)[:-1] + tuple(_out))

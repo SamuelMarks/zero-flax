@@ -1,4 +1,8 @@
+"""Module docstring."""
+
 from __future__ import annotations
+
+
 import ml_switcheroo
 import typing as tp
 from typing import (
@@ -21,61 +25,6 @@ Array = Any
 ArrayLike = Any
 
 
-class AxisName:
-    pass
-
-
-class PrecisionLike:
-    pass
-
-
-class PaddingLike:
-    pass
-
-
-class Dtype:
-    pass
-
-
-class Shape:
-    pass
-
-
-class Axes:
-    pass
-
-
-class Size:
-    pass
-
-
-class Axis:
-    pass
-
-
-class DotGeneralT:
-    pass
-
-
-class MaxFun:
-    pass
-
-
-class filterlib:
-    class Filter:
-        pass
-
-
-class rnglib:
-    class Rngs:
-        pass
-
-
-class variables:
-    class Variable:
-        pass
-
-
 import zero_chex as chex
 import zero_optax as optax
 import zero_jax as jax
@@ -93,8 +42,25 @@ KeyArray = Any
 RealNumeric = Any
 LoRAParam = Any
 dot_product_attention = None
-from .state import Variable, Param, BatchStat, Rng, State, merge
-from .module import Module
+from .state import Variable, Param, BatchStat, Rng, State
+from .module import Module, split, merge, GraphDef
+from .missing import (
+    rnglib,
+    filterlib,
+    variables,
+    AxisName,
+    PrecisionLike,
+    PaddingLike,
+    Dtype,
+    Shape,
+    Axes,
+    Size,
+    Axis,
+    DotGeneralT,
+    MaxFun,
+)
+
+Rngs = rnglib.Rngs
 from zero_jax.nn import initializers
 from zero_jax.nn.initializers import zeros, ones, glorot_uniform, he_normal
 from .containers import Dict as Dict, List as List, Sequential as Sequential

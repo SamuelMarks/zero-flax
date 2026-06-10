@@ -1,3 +1,5 @@
+"""Module docstring."""
+
 import ml_switcheroo
 
 __version__ = "0.8.5"

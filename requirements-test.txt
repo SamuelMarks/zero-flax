@@ -1,0 +1,6 @@
+pytest
+pytest-cov
+flax==0.8.5
+jax
+jaxlib
+absl-py
