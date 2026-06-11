@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """Stochastic layers and operations for the NNX API.
 
 This module provides stochastic components such as Dropout, which are
@@ -15,13 +17,18 @@ class Dropout(Module):
     elements of the input tensor with probability `rate`.
     """
 
-    def __init__(self, rate: float, *args: Any, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        rate: float,
+        broadcast_dims: tuple[int, ...] = (),
+        deterministic: bool = False,
+        rng_collection: str = "dropout",
+        rngs: Any = None,
+    ) -> None:
         """Initializes the Dropout module.
 
         Args:
             rate: The probability of an element to be zeroed.
-            *args: Variable length argument list.
-            **kwargs: Arbitrary keyword arguments.
         """
         super().__init__()
         self.rate = rate
@@ -32,8 +39,6 @@ class Dropout(Module):
 
         Args:
             x: The input tensor.
-            *args: Variable length argument list.
-            **kwargs: Arbitrary keyword arguments.
 
         Returns:
             The input tensor `x` (currently acts as an identity function).

@@ -1,6 +1,6 @@
 import pytest
 import numpy as np
-from jax import numpy as jnp
+from ml_switcheroo import jnp
 import zero_flax.nnx as nnx
 from zero_flax.nnx.missing import filterlib, variables, rnglib
 from zero_flax.nnx import state

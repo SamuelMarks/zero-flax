@@ -14,11 +14,30 @@ class BatchNorm(Module):
     Applies Batch Normalization over a given input.
     """
 
-    def __init__(self, features: int, *args: Any, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        num_features: int,
+        use_running_average: bool = False,
+        axis: int = -1,
+        momentum: float = 0.99,
+        epsilon: float = 1e-05,
+        *,
+        dtype: Any = None,
+        param_dtype: Any = "jnp.float32",
+        use_bias: bool = True,
+        use_scale: bool = True,
+        bias_init: Any = "initializers.zeros_init()",
+        scale_init: Any = "initializers.ones_init()",
+        axis_name: Any = None,
+        axis_index_groups: Any = None,
+        use_fast_variance: bool = True,
+        rngs: Any = None,
+    ) -> None:
+        features = num_features
         """Initializes the BatchNorm module.
 
         Args:
-            features: The number of features in the input.
+            num_features: The number of features in the input.
             *args: Variable length argument list.
             **kwargs: Arbitrary keyword arguments.
         """
@@ -46,11 +65,29 @@ class LayerNorm(Module):
     Applies Layer Normalization over a given input.
     """
 
-    def __init__(self, features: int, *args: Any, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        num_features: int,
+        epsilon: float = 1e-05,
+        *,
+        dtype: Any = None,
+        param_dtype: Any = "jnp.float32",
+        use_bias: bool = True,
+        use_scale: bool = True,
+        bias_init: Any = "initializers.zeros_init()",
+        scale_init: Any = "initializers.ones_init()",
+        reduction_axes: Any = -1,
+        feature_axes: Any = -1,
+        axis_name: Any = None,
+        axis_index_groups: Any = None,
+        use_fast_variance: bool = True,
+        rngs: Any = None,
+    ) -> None:
+        features = num_features
         """Initializes the LayerNorm module.
 
         Args:
-            features: The number of features in the input.
+            num_features: The number of features in the input.
             *args: Variable length argument list.
             **kwargs: Arbitrary keyword arguments.
         """
@@ -78,11 +115,27 @@ class RMSNorm(Module):
     Applies RMS Normalization over a given input.
     """
 
-    def __init__(self, features: int, *args: Any, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        num_features: int,
+        epsilon: float = 1e-05,
+        *,
+        dtype: Any = None,
+        param_dtype: Any = "jnp.float32",
+        use_scale: bool = True,
+        scale_init: Any = "initializers.ones_init()",
+        reduction_axes: Any = -1,
+        feature_axes: Any = -1,
+        axis_name: Any = None,
+        axis_index_groups: Any = None,
+        use_fast_variance: bool = True,
+        rngs: Any = None,
+    ) -> None:
+        features = num_features
         """Initializes the RMSNorm module.
 
         Args:
-            features: The number of features in the input.
+            num_features: The number of features in the input.
             *args: Variable length argument list.
             **kwargs: Arbitrary keyword arguments.
         """

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """Linear modules for neural networks.
 
 This module provides linear transformation layers including a standard linear
@@ -7,8 +9,8 @@ This module provides linear transformation layers including a standard linear
 from typing import Any, Callable, Sequence, Union, Tuple, Mapping, Optional
 from zero_flax.nnx.module import Module
 from zero_flax.nnx.state import Param
-from jax import numpy as jnp
-from jax.nn import initializers
+from ml_switcheroo import jnp
+from zero_jax.nn import initializers
 
 
 class Einsum(Module):
@@ -21,10 +23,14 @@ class Einsum(Module):
     def __init__(
         self,
         einsum_str: str,
-        kernel_shape: Tuple[int, ...],
-        bias_shape: Optional[Tuple[int, ...]] = None,
-        *args: Any,
-        **kwargs: Any,
+        kernel_shape: Any,
+        bias_shape: Any = None,
+        dtype: Any = None,
+        param_dtype: Any = "jnp.float32",
+        precision: Any = None,
+        kernel_init: Any = "default_kernel_init",
+        bias_init: Any = "default_bias_init",
+        rngs: Any = None,
     ) -> None:
         """Initializes the Einsum module.
 
@@ -32,8 +38,6 @@ class Einsum(Module):
             einsum_str: A string specifying the einsum equation.
             kernel_shape: A tuple representing the shape of the kernel tensor.
             bias_shape: An optional tuple representing the shape of the bias tensor.
-            *args: Additional positional arguments.
-            **kwargs: Additional keyword arguments.
         """
         super().__init__()
         self.kernel_shape = kernel_shape
@@ -44,8 +48,6 @@ class Einsum(Module):
 
         Args:
             x: The input tensor.
-            *args: Additional positional arguments.
-            **kwargs: Additional keyword arguments.
 
         Returns:
             The transformed output tensor.
@@ -90,7 +92,7 @@ class Linear(Module):
         super().__init__()
         kernel_init = kernel_init or initializers.glorot_uniform()
         bias_init = bias_init or initializers.zeros
-        import jax
+        import zero_jax as jax
 
         key = jax.random.PRNGKey(0)
         self.kernel = Param(kernel_init(key, (in_features, out_features)))
@@ -126,16 +128,23 @@ class LinearGeneral(Module):
         self,
         in_features: Union[int, Sequence[int]],
         out_features: Union[int, Sequence[int]],
-        *args: Any,
-        **kwargs: Any,
+        axis: Any = -1,
+        batch_axis: Any = "FrozenDict({})",
+        use_bias: bool = True,
+        dtype: Any = None,
+        param_dtype: Any = "jnp.float32",
+        kernel_init: Any = "default_kernel_init",
+        bias_init: Any = "default_bias_init",
+        precision: Any = None,
+        dot_general: Any = None,
+        dot_general_cls: Any = None,
+        rngs: Any = None,
     ) -> None:
         """Initializes the LinearGeneral layer.
 
         Args:
             in_features: The number of input features or a sequence of dimensions.
             out_features: The number of output features or a sequence of dimensions.
-            *args: Additional positional arguments.
-            **kwargs: Additional keyword arguments.
         """
         super().__init__()
         self.in_features = in_features

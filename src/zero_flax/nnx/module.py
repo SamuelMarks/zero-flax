@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """Base module system for the NNX API.
 
 This module provides the core building blocks for neural network modules,

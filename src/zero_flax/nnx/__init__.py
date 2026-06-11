@@ -29,7 +29,7 @@ ArrayLike = Any
 
 import chex as chex
 import optax as optax
-import jax as jax
+import zero_jax as jax
 
 M = tp.TypeVar("M")
 A = tp.TypeVar("A")
@@ -63,8 +63,8 @@ from .missing import (
 )
 
 Rngs = rnglib.Rngs
-from jax.nn import initializers
-from jax.nn.initializers import zeros, ones, glorot_uniform, he_normal
+from zero_jax.nn import initializers
+from zero_jax.nn.initializers import zeros, ones, glorot_uniform, he_normal
 from .containers import Dict as Dict, List as List, Sequential as Sequential
 from .linear import Einsum as Einsum, Linear as Linear, LinearGeneral as LinearGeneral
 from .normalization import (

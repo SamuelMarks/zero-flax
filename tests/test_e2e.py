@@ -2,7 +2,7 @@
 
 import numpy as np
 from zero_flax.nnx import Module, Dense, Param
-from jax import numpy as jnp
+from ml_switcheroo import jnp
 
 
 def value_and_grad(f):

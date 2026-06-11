@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """State and Variable tracking for nnx."""
 
 from typing import Any

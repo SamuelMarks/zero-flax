@@ -12,7 +12,7 @@ from zero_flax.nnx import (
 
 
 def test_dense():
-    from jax.nn import initializers
+    from zero_jax.nn import initializers
 
     d = Dense(2, 3, kernel_init=initializers.ones, bias_init=initializers.zeros)
     x = np.ones((1, 2))

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """Container modules for neural networks.
 
 This module provides standard container modules like Dict, List, and Sequential
