@@ -1,7 +1,1 @@
-numpy
-zero-jax
-zero-chex
-zero-optax
-zero-orbax
-zero-grain
-ml-switcheroo-compiler
+

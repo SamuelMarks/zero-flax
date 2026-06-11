@@ -22,7 +22,7 @@ allow-direct-references = true
 [tool.hatch.metadata.hooks.requirements_txt]
 files = ["requirements.txt"]
 
-dependencies = ["ml-switcheroo-compiler"]
+dependencies = []
 
 [tool.ruff.lint]
 ignore = ['E402', 'F401', 'F841', 'E741', 'E501']

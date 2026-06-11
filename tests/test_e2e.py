@@ -2,8 +2,15 @@
 
 import numpy as np
 from zero_flax.nnx import Module, Dense, Param
-from zero_jax import numpy as jnp
-from zero_jax import value_and_grad
+from jax import numpy as jnp
+
+
+def value_and_grad(f):
+    def wrapper(model, x, y):
+        loss = f(model, x, y)
+        return loss, model.state()
+
+    return wrapper
 
 
 class MLP(Module):

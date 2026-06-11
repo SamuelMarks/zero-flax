@@ -1,24 +1,47 @@
-"""Module system for nnx."""
+"""Base module system for the NNX API.
+
+This module provides the core building blocks for neural network modules,
+including state management, module serialization (split/merge), and graph definitions.
+"""
 
 from typing import Any
 from zero_flax.nnx.state import Variable, State
 
 
 class Module:
-    """Docstring."""
+    """Base class for all neural network modules.
+
+    Modules handle state, track variable attributes, and maintain child modules.
+    Variables and children can only be assigned during initialization.
+    """
 
     _children: dict[str, Any]
     _variables: dict[str, Variable]
     _is_initializing: bool
 
-    def __init__(self):
-        """Docstring."""
+    def __init__(self) -> None:
+        """Initializes a new Module instance.
+
+        Sets up the internal tracking for children and variables and flags
+        the module as initializing.
+        """
         super().__setattr__("_is_initializing", True)
         super().__setattr__("_children", {})
         super().__setattr__("_variables", {})
 
-    def __setattr__(self, name: str, value: Any):
-        """Docstring."""
+    def __setattr__(self, name: str, value: Any) -> None:
+        """Sets an attribute on the module.
+
+        Tracks variables and children automatically. Raises an error if new
+        attributes are added after initialization is complete.
+
+        Args:
+            name: The name of the attribute to set.
+            value: The value to assign to the attribute.
+
+        Raises:
+            ValueError: If attempting to add a new attribute after initialization.
+        """
         if name in ["_is_initializing", "_children", "_variables"]:
             super().__setattr__(name, value)
             return
@@ -41,7 +64,13 @@ class Module:
         super().__setattr__(name, value)
 
     def state(self) -> State:
-        """Docstring."""
+        """Retrieves the state of the module.
+
+        Extracts state from all tracked variables and child modules recursively.
+
+        Returns:
+            A State object containing the complete module state.
+        """
         s = State()
         if hasattr(self, "_variables"):
             for k, v in self._variables.items():
@@ -52,7 +81,12 @@ class Module:
         return s
 
     def update(self, *args: Any, **kwargs: Any) -> None:
-        """Docstring."""
+        """Updates the module's state with the provided state.
+
+        Args:
+            *args: Positional arguments, optionally containing the state dictionary.
+            **kwargs: Keyword arguments, optionally providing the `state` key.
+        """
         state_val = args[0] if args else kwargs.get("state")
         if state_val is None:
             return
@@ -64,22 +98,44 @@ class Module:
 
 
 class GraphDef:
-    """Docstring."""
+    """Defines the static structure of a Module graph.
 
-    def __init__(self, cls, children_defs, static_fields):
-        """Docstring."""
+    GraphDef stores the static structure and non-state fields required to
+    reconstruct a Module from a State object.
+    """
+
+    def __init__(
+        self,
+        cls: type[Any],
+        children_defs: dict[str, Any],
+        static_fields: dict[str, Any],
+    ) -> None:
+        """Initializes the GraphDef.
+
+        Args:
+            cls: The class of the module to reconstruct.
+            children_defs: A dictionary mapping child names to their GraphDefs.
+            static_fields: A dictionary of non-variable, static fields.
+        """
         self.cls = cls
         self.children_defs = children_defs
         self.static_fields = static_fields
 
-    def merge(self, state: State):
-        """Docstring."""
+    def merge(self, state: State) -> Any:
+        """Merges the static graph definition with dynamic state to rebuild the module.
+
+        Args:
+            state: A State object or a tuple of State objects.
+
+        Returns:
+            An instantiated Module populated with the provided state.
+        """
         from zero_flax.nnx.state import merge as state_merge
 
         if isinstance(state, tuple):
             state = state_merge(*state)
 
-        m = self.cls.__new__(self.cls)
+        m = self.cls.__new__(self.cls)  # type: ignore
         m._is_initializing = True
         m._children = {}
         m._variables = {}
@@ -103,17 +159,31 @@ class GraphDef:
         return m
 
 
-def split(module, *filters):
-    """Docstring."""
+def split(module: Any, *filters: Any) -> tuple[Any, ...]:
+    """Splits a module into its static GraphDef and dynamic State objects.
+
+    Args:
+        module: The module to split.
+        *filters: Optional filter criteria used to partition the resulting state.
+
+    Returns:
+        A tuple containing the GraphDef as the first element, followed by one or
+        more partitioned State objects.
+    """
     # For dummy implementation in API shell, we return empty state and empty gdef
     # if the module is just standard dict/list containers.
     # We will traverse simply
-    children_defs = {}
+    children_defs: dict[str, Any] = {}
     static_fields = {}
     state_dict = State()
 
-    def _extract_state(m, prefix=""):
-        """Docstring."""
+    def _extract_state(m: Any, prefix: str = "") -> None:
+        """Extracts the state recursively from a module.
+
+        Args:
+            m: The module to extract state from.
+            prefix: The string prefix for nested module names.
+        """
         if hasattr(m, "_variables"):
             for k, v in m._variables.items():
                 state_dict[prefix + k] = v
@@ -135,8 +205,18 @@ def split(module, *filters):
     return (gdef,) + res
 
 
-def merge(*args):
-    """Docstring."""
+def merge(*args: Any) -> Any:
+    """Merges a GraphDef and state(s) or multiple states together.
+
+    If the first argument is a GraphDef, it rebuilds the module using the provided states.
+    Otherwise, it delegates to state merging.
+
+    Args:
+        *args: Either a GraphDef followed by states, or multiple states to merge.
+
+    Returns:
+        A reconstructed Module if the first argument is a GraphDef, otherwise a merged State.
+    """
     # If the first arg is a GraphDef, use GraphDef.merge
     # If the first arg is a State/tuple of states, use state.merge
     if args and type(args[0]).__name__ == "GraphDef":

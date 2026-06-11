@@ -22,6 +22,12 @@ repos:
         types: [python]
         pass_filenames: false
 
+      - id: api-compliance
+        name: API Compliance Check
+        entry: ml_framework_snapshots check flax src/zero_flax --reference-prefix flax --target-prefix zero_flax
+        language: system
+        pass_filenames: false
+
       - id: update-badges
         name: Update Coverage Shields
         entry: python3 scripts/update_badges.py

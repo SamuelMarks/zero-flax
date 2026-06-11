@@ -16,7 +16,7 @@ def test_linear_general():
 
 
 def test_linear_init():
-    from zero_jax.nn import initializers
+    from jax.nn import initializers
 
     l = nnx.Linear(
         3, 4, kernel_init=initializers.ones, bias_init=initializers.zeros, use_bias=True

@@ -1,9 +1,13 @@
-"""Module docstring."""
+"""Flax NNX API compatibility layer and exports for zero-flax.
+
+This module consolidates and exports the core components of the zero-flax NNX
+implementation, including base module classes, state management, standard layers
+(e.g., Linear, Conv, Embed), normalization techniques, and typing utilities.
+"""
 
 from __future__ import annotations
 
 
-import ml_switcheroo
 import typing as tp
 from typing import (
     Any,
@@ -18,16 +22,14 @@ from typing import (
     Type,
 )
 import collections.abc
-import numpy
-from zero_jax import numpy as jnp
 
 Array = Any
 ArrayLike = Any
 
 
-import zero_chex as chex
-import zero_optax as optax
-import zero_jax as jax
+import chex as chex
+import optax as optax
+import jax as jax
 
 M = tp.TypeVar("M")
 A = tp.TypeVar("A")
@@ -61,8 +63,8 @@ from .missing import (
 )
 
 Rngs = rnglib.Rngs
-from zero_jax.nn import initializers
-from zero_jax.nn.initializers import zeros, ones, glorot_uniform, he_normal
+from jax.nn import initializers
+from jax.nn.initializers import zeros, ones, glorot_uniform, he_normal
 from .containers import Dict as Dict, List as List, Sequential as Sequential
 from .linear import Einsum as Einsum, Linear as Linear, LinearGeneral as LinearGeneral
 from .normalization import (
