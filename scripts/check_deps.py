@@ -5,7 +5,6 @@ import importlib.util
 import sysconfig
 
 ALLOWED_3RD_PARTY = {
-    "numpy",
     "pydantic",
     "cdd",
     "ml_switcheroo_ir",

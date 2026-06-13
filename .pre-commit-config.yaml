@@ -43,6 +43,18 @@ repos:
         pass_filenames: false
 
 
+      - id: check-compiler-tests
+        name: Check Compiler Parity Tests
+        entry: python3 scripts/check_compiler_tests.py
+        language: system
+        pass_filenames: false
+
+      - id: check-parity-tests
+        name: Check Parity Tests
+        entry: python3 scripts/check_parity_tests.py
+        language: system
+        pass_filenames: false
+
       - id: check-api-compliance
         name: Check API Conformance
         entry: env PYTHONPATH=src:../ml-switcheroo-compiler/src:../zero-jax/src:../zero-optax/src python3 scripts/check_compliance.py
