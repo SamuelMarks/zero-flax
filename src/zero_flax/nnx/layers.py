@@ -10,7 +10,7 @@ from typing import Any, Callable, Tuple
 from zero_flax.nnx.module import Module
 from zero_flax.nnx.state import Param
 from zero_jax.nn import initializers
-from ml_switcheroo import jnp
+from zero_jax import numpy as jnp
 
 
 class Dense(Module):

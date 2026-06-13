@@ -27,8 +27,8 @@ Array = Any
 ArrayLike = Any
 
 
-import chex as chex
-import optax as optax
+import zero_chex as chex
+import zero_optax as optax
 import zero_jax as jax
 
 M = tp.TypeVar("M")

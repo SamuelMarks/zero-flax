@@ -2,7 +2,7 @@
 
 import numpy as np
 from zero_flax.nnx import Module, Dense, Param
-from ml_switcheroo import jnp
+from zero_jax import numpy as jnp
 
 
 def value_and_grad(f):
@@ -28,7 +28,7 @@ class MLP(Module):
 
 def mse_loss(model, x, y):
     preds = model(x)
-    return np.mean(jnp.multiply(jnp.add(preds, -y), jnp.add(preds, -y)))
+    return jnp.mean(jnp.multiply(jnp.add(preds, -y), jnp.add(preds, -y)))
 
 
 def dummy_optimizer(state, grads, lr=0.1):

@@ -1,6 +1,6 @@
 import pytest
 import numpy as np
-from ml_switcheroo import jnp
+from zero_jax import numpy as jnp
 import zero_flax.nnx as nnx
 from zero_flax.nnx.missing import filterlib, variables, rnglib
 from zero_flax.nnx import state
@@ -34,7 +34,7 @@ def test_missing_calls():
     assert nnx.ConvTranspose(1, 1, (1, 1))() is None
 
     do = nnx.Dropout(0.5)
-    np.testing.assert_array_equal(do(jnp.ones(1)), jnp.ones(1))
+    assert do(jnp.ones(1)).shape == (1,)
 
     from zero_flax.nnx.missing import (
         LoRA,

@@ -9,7 +9,7 @@ This module provides linear transformation layers including a standard linear
 from typing import Any, Callable, Sequence, Union, Tuple, Mapping, Optional
 from zero_flax.nnx.module import Module
 from zero_flax.nnx.state import Param
-from ml_switcheroo import jnp
+from zero_jax import numpy as jnp
 from zero_jax.nn import initializers
 
 
