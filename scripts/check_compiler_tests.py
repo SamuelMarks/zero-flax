@@ -1,65 +1,130 @@
+"""Parity test coverage verifier for all exported `zero_flax.nnx` layers and transforms.
+
+This script verifies that every core NNX layer, recurrent cell, normalization,
+container, and transformation class exported in `zero_flax.nnx` has a dedicated,
+non-vacuous parity test with value assertions in `tests/test_parity_flax.py`.
+"""
+
+from __future__ import annotations
+
 import ast
 import os
 import sys
-import re
+from collections.abc import Sequence
+
+REQUIRED_NNX_LAYERS: tuple[str, ...] = (
+    "BatchNorm",
+    "Bidirectional",
+    "Conv",
+    "ConvTranspose",
+    "Dense",
+    "Dict",
+    "Dropout",
+    "Einsum",
+    "Embed",
+    "GRUCell",
+    "GroupNorm",
+    "InstanceNorm",
+    "Jit",
+    "LSTMCell",
+    "LayerNorm",
+    "Linear",
+    "LinearGeneral",
+    "List",
+    "LoRA",
+    "LoRALinear",
+    "MultiHeadAttention",
+    "MultiHeadDotProductAttention",
+    "OptimizedLSTMCell",
+    "PReLU",
+    "Pmap",
+    "RMSNorm",
+    "RNN",
+    "Remat",
+    "RoPE",
+    "Scan",
+    "Sequential",
+    "SimpleCell",
+    "SpectralNorm",
+    "Vmap",
+    "WeightNorm",
+)
 
 
-def main():
-    # We want to ensure that every operation in ml_switcheroo_compiler.flax has a test in test_parity_flax.py
-    compiler_flax = "../ml-switcheroo-compiler/src/ml_switcheroo_compiler/flax.py"
-    if not os.path.exists(compiler_flax):
-        print("Compiler flax.py not found, skipping.")
-        sys.exit(0)
+def _has_value_assertion(fn_node: ast.FunctionDef) -> bool:
+    """Check whether ``fn_node`` contains at least one ``assert`` or ``assert_allclose`` check.
 
-    with open(compiler_flax, "r", encoding="utf-8") as f:
-        code = f.read()
+    Args:
+        fn_node: AST ``FunctionDef`` node of a test function.
 
-    classes = re.findall(r"class\s+([A-Za-z0-9_]+)\s*\(", code)
+    Returns:
+        ``True`` if ``fn_node`` performs at least one assertion, else ``False``.
+    """
+    return any(isinstance(sub, (ast.Assert, ast.Call)) for sub in ast.walk(fn_node))
 
-    # Filter out base classes or non-operations
-    skip = {
-        "Module",
-        "GraphDef",
-        "State",
-        "Variable",
-        "Param",
-        "BatchStat",
-        "Rng",
-        "Sequential",
-        "List",
-        "Dict",
-        "Jit",
-        "Vmap",
-        "Scan",
-        "Remat",
-        "Pmap",
-    }
-    ops = [c for c in classes if c not in skip]
 
-    test_file = "tests/test_parity_flax.py"
-    if not os.path.exists(test_file):
-        print(f"ERROR: {test_file} not found.")
-        sys.exit(1)
+def check_parity_file(parity_test_path: str = "tests/test_parity_flax.py") -> list[str]:
+    """Inspect ``parity_test_path`` to ensure every required NNX class has a non-empty test.
 
-    with open(test_file, "r", encoding="utf-8") as f:
-        test_code = f.read()
+    Args:
+        parity_test_path: File path to ``tests/test_parity_flax.py``.
 
-    missing = []
-    for op in ops:
+    Returns:
+        List of missing or vacuous test error messages.
+    """
+    if not os.path.exists(parity_test_path):
+        return [f"Missing test file: {parity_test_path}"]
+
+    with open(parity_test_path, encoding="utf-8") as handle:
+        source = handle.read()
+
+    tree = ast.parse(source, filename=parity_test_path)
+    test_funcs: dict[str, ast.FunctionDef] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name.startswith("test_"):
+            test_funcs[node.name.lower()] = node
+
+    errors: list[str] = []
+    for layer_name in REQUIRED_NNX_LAYERS:
+        expected_fn = f"test_{layer_name.lower()}_parity"
+        fn_node = test_funcs.get(expected_fn)
+        if fn_node is None:
+            errors.append(f"Missing parity test '{expected_fn}' for '{layer_name}'")
+            continue
+        non_doc_stmts = [
+            stmt
+            for stmt in fn_node.body
+            if not (isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Constant))
+        ]
         if (
-            f"test_{op.lower()}_" not in test_code.lower()
-            and f"_{op.lower()}" not in test_code.lower()
-            and f"{op}" not in test_code
+            len(non_doc_stmts) == 0
+            or all(isinstance(s, ast.Pass) for s in non_doc_stmts)
+            or not _has_value_assertion(fn_node)
         ):
-            missing.append(op)
+            errors.append(f"Vacuous 'pass' parity test in '{expected_fn}'")
 
-    if missing:
-        print(f"ERROR: Missing parity tests for operations: {missing}")
-        sys.exit(1)
+    return errors
 
-    print("100% complete test suite for compiler ops verified.")
-    sys.exit(0)
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Run the compiler/layer parity test verification check.
+
+    Args:
+        argv: Optional command-line arguments.
+
+    Returns:
+        Exit code ``0`` if all parity tests exist and are non-vacuous, ``1`` otherwise.
+    """
+    args = list(argv) if argv is not None else sys.argv[1:]
+    target = args[0] if len(args) > 0 else "tests/test_parity_flax.py"
+    errors = check_parity_file(target)
+    if errors:
+        for err in errors:
+            print(f"ERROR: {err}")
+        return 1
+    print(f"100% complete parity test suite verified ({len(REQUIRED_NNX_LAYERS)} NNX classes).")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

@@ -1,226 +1,293 @@
-import pytest
+"""Comprehensive coverage tests for `zero_flax.nnx` modules, containers, layers, and types."""
+
+from __future__ import annotations
+
 import numpy as np
-from zero_jax import numpy as jnp
+from zero_jax.nn import initializers
+
+import zero_flax
 import zero_flax.nnx as nnx
-from zero_flax.nnx.missing import filterlib, variables, rnglib
 from zero_flax.nnx import state
-from zero_flax.nnx.linear import Linear
-from zero_flax.nnx.module import Module, GraphDef
+from zero_flax.nnx.linear import Einsum, Linear, LinearGeneral
+from zero_flax.nnx.missing import filterlib, rnglib, variables
 
 
-def test_missing_classes():
-    assert nnx.Dtype() is not None
-    assert nnx.Shape() is not None
-    assert nnx.Axes() is not None
-    assert nnx.Size() is not None
-    assert nnx.Axis() is not None
-    assert nnx.DotGeneralT() is not None
-    assert nnx.MaxFun() is not None
-    assert filterlib.Filter() is not None
-    assert rnglib.Rngs() is not None
-    assert variables.Variable() is not None
-    assert nnx.missing.AxisName() is not None
-    assert nnx.missing.PrecisionLike() is not None
-    assert nnx.missing.PaddingLike() is not None
-    assert nnx.missing.Initializer() is not None
+def test_containers() -> None:
+    """Verify Dict, List, and Sequential container initialization and execution."""
+    zero_flax.enable_eager_mode(False)
+    zero_flax.enable_eager_mode(True)
+
+    d1 = nnx.Dict({"a": 1, "b": 2})
+    assert "a" in d1
+    assert d1["a"] == 1
+    assert list(d1) == ["a", "b"]
+    assert len(d1) == 2
+    d2 = nnx.Dict([("a", 1), ("b", 2)])
+    assert d2["b"] == 2
+    d3 = nnx.Dict(a=1, b=2)
+    assert d3["a"] == 1
+    d4: nnx.Dict[nnx.Module | nnx.Param[int]] = nnx.Dict()
+    d4["lin"] = nnx.Linear(2, 2)
+    d4["param"] = nnx.Param(1)
+    assert "lin" in d4.state()
+    assert "param" in d4.state()
+
+    l1 = nnx.List([1, 2, 3])
+    assert len(l1) == 3
+    l2: nnx.List[nnx.Module | nnx.Param[int]] = nnx.List()
+    l2.extend([nnx.Linear(2, 2), nnx.Param(3)])
+    assert len(l2) == 2
+    assert "0" in l2.state()
+    assert "1" in l2.state()
+
+    def fn1(x: float, a: float = 1.0) -> float:
+        """Add ``a`` to ``x``.
+
+        Args:
+            x: Input scalar.
+            a: Offset to add.
+
+        Returns:
+            Sum ``x + a``.
+        """
+        return x + a
+
+    def fn2(x: float, a: float = 1.0) -> float:
+        """Multiply ``x`` by ``2 * a``.
+
+        Args:
+            x: Input scalar.
+            a: Multiplier factor.
+
+        Returns:
+            Product ``x * 2 * a``.
+        """
+        return x * 2.0 * a
+
+    seq = nnx.Sequential(fn1, fn2)
+    assert seq(2.0, a=2.0) == 16.0
 
 
-def test_missing_calls():
-    assert nnx.Jit(lambda: None)() is None
-    assert nnx.Remat(lambda: None)() is None
-    assert nnx.Vmap(lambda: None)() is None
-    assert nnx.Scan(lambda: None)() is None
-    assert nnx.Pmap(lambda: None)() is None
-    assert nnx.ConvTranspose(1, 1, (1, 1))() is None
+def test_layers() -> None:
+    """Verify Dense, Conv, Embed, and MultiHeadDotProductAttention with various arguments."""
+    x = np.ones((2, 3), dtype=np.float32)
+    d1 = nnx.Dense(3, 4, rngs=rnglib.Rngs(0))
+    assert d1(x).shape == (2, 4)
 
-    do = nnx.Dropout(0.5)
-    assert do(jnp.ones(1)).shape == (1,)
-
-    from zero_flax.nnx.missing import (
-        LoRA,
-        LoRALinear,
-        MultiHeadAttention,
-        BatchNorm,
-        Dropout as MissingDropout,
+    d2 = nnx.Dense(
+        3,
+        4,
+        use_bias=False,
+        kernel_init=initializers.ones,
+        bias_init=initializers.zeros,
     )
+    assert d2(x).shape == (2, 4)
 
-    assert LoRA(1, 1, 1)() is None
-    assert LoRALinear(1, 1, 1)() is None
-    assert MultiHeadAttention(1, 1)() is None
-    assert BatchNorm(1)() is None
-    assert MissingDropout(0.5)() is None
+    c1 = nnx.Conv(3, 4, kernel_size=3, rngs=rnglib.Rngs(0))
+    x_conv = np.ones((1, 5, 3), dtype=np.float32)
+    assert c1(x_conv).shape == (1, 5, 4)
 
+    c2 = nnx.Conv(
+        3,
+        4,
+        kernel_size=(3, 3),
+        strides=(1, 1),
+        input_dilation=(1, 1),
+        kernel_dilation=(1, 1),
+        use_bias=False,
+        kernel_init=initializers.ones,
+        bias_init=initializers.zeros,
+    )
+    x_conv2 = np.ones((1, 5, 5, 3), dtype=np.float32)
+    assert c2(x_conv2).shape == (1, 5, 5, 4)
 
-def test_containers():
-    d = nnx.Dict()
-    d["k"] = 1
-    assert d["k"] == 1
-    d = nnx.Dict(k=2)
-    assert d["k"] == 2
-    assert d() is None
+    e1 = nnx.Embed(10, 4, rngs=rnglib.Rngs(0))
+    idx = np.array([1, 2, 3], dtype=np.int32)
+    assert e1(idx).shape == (3, 4)
 
-    l = nnx.List([1, 2])
-    assert len(list(l)) == 2
-    l[0] = 3
-    assert l[0] == 3
+    e2 = nnx.Embed(10, 4, embedding_init=initializers.ones, promote_dtype=None)
+    assert e2(idx).shape == (3, 4)
+    assert e2.attend(np.ones((2, 4), dtype=np.float32)).shape == (2, 10)
 
-    seq = nnx.Sequential(lambda x: x + 1, lambda x: x * 2)
-    assert seq(1) == 4
-
-
-def test_linear_no_bias():
-    l = Linear(2, 2, use_bias=False)
-    l.kernel = nnx.Param(jnp.ones((2, 2)))
-    out = l(jnp.ones((1, 2)))
-    assert out.shape == (1, 2)
-
-
-def test_module_missing_attrs():
-    class BadMod(nnx.Module):
-        def __init__(self):
-            super().__setattr__("_is_initializing", False)
-            object.__setattr__(self, "x", 1)
-
-    m = BadMod()
-    m.x = 2
-    assert m.x == 2
-
-    s = m.state()
-    assert len(s) == 0
-
-    g, s2 = nnx.split(m)
-    assert len(s2) == 0
-
-    with pytest.raises(ValueError):
-        m.new_attr = 1
+    mha = nnx.MultiHeadDotProductAttention(2, 4, 8)
+    assert mha(np.ones((1, 2, 4), dtype=np.float32)).shape == (1, 2, 4)
 
 
-def test_module_coverage():
-    class M(nnx.Module):
-        def __init__(self):
-            super().__init__()
-            self.x = 1
-            self.y = nnx.Param(2)
-            self.sub = nnx.Sequential()
+def test_linear() -> None:
+    """Verify Linear, LinearGeneral, and Einsum across sequence and integer feature configurations."""
+    x = np.ones((2, 3), dtype=np.float32)
+    l1 = Linear(3, 4, rngs=rnglib.Rngs(0), preferred_element_type="float32", promote_dtype=None)
+    assert l1(x).shape == (2, 4)
 
-    m = M()
-    g, s = nnx.split(m)
-    assert s is not None
-    m2 = nnx.merge(g, s)
-    assert m2.x == 1
+    l2 = Linear(
+        3,
+        4,
+        use_bias=False,
+        kernel_init=initializers.ones,
+        bias_init=initializers.zeros,
+        dot_general=nnx.DotGeneralT(),
+    )
+    assert l2(x).shape == (2, 4)
 
-    s = m.state()
-    assert s["y"].value == 2
+    lg1 = LinearGeneral(
+        3,
+        4,
+        axis=-1,
+        batch_axis=None,
+        rngs=rnglib.Rngs(0),
+        preferred_element_type="float32",
+        promote_dtype=None,
+    )
+    assert lg1(x).shape == (2, 4)
+    assert lg1(np.ones((3,), dtype=np.float32)).shape == (4,)
 
-    s["y"].value = 3
-    m.update(s)
-    assert m.y.value == 3
+    lg2 = LinearGeneral(
+        (2, 3),
+        (4, 5),
+        axis=(-2, -1),
+        use_bias=False,
+        kernel_init=initializers.ones,
+        bias_init=initializers.zeros,
+        dot_general_cls=nnx.DotGeneralT,
+    )
+    x_lg2 = np.ones((2, 2, 3), dtype=np.float32)
+    assert lg2(x_lg2).shape == (2, 4, 5)
 
-    m.update(None)
+    lg_batch = LinearGeneral(
+        3,
+        4,
+        axis=-1,
+        batch_axis=[0],
+        use_bias=True,
+        kernel_init=initializers.ones,
+        bias_init=initializers.zeros,
+    )
+    lg_batch.kernel.value = np.ones((2, 3, 4), dtype=np.float32)
+    assert lg_batch(np.ones((2, 3), dtype=np.float32)).shape == (2, 4)
 
+    e1 = Einsum(
+        "ab,bc->ac",
+        (3, 4),
+        (4,),
+        rngs=rnglib.Rngs(0),
+        preferred_element_type="float32",
+        promote_dtype=None,
+    )
+    assert e1(x).shape == (2, 4)
 
-def test_module_missing_paths():
-    class M(nnx.Module):
-        def __init__(self):
-            super().__init__()
-            self.p = nnx.Param(1)
-            self.c = nnx.List()
-
-    m = M()
-    m.foo = "bar"
-    assert m.foo == "bar"
-
-    g, s = nnx.split(m)
-    m2 = nnx.merge(g, s)
-    assert m2.p.value == 1
-
-    class N(nnx.Module):
-        def __init__(self):
-            super().__init__()
-            self.x = 1
-
-    n = N()
-    n.p = nnx.Param(2)
-    assert n.state()["p"].value == 2
-
-    s2 = nnx.State({"unknown": nnx.Param(3)})
-    n.update(s2)
-
-
-def test_module_missing_paths2():
-    class M(nnx.Module):
-        def __init__(self):
-            pass
-
-    m = M()
-    m.c = nnx.List()
-    m.v = nnx.Param(1)
-    assert hasattr(m, "_children")
-    assert hasattr(m, "_variables")
-
-
-def test_module_missing_paths3():
-    class M(nnx.Module):
-        def __init__(self):
-            super().__init__()
-            self.c = nnx.List()
-            self.p = nnx.Param(1)
-
-    m = M()
-    g = nnx.GraphDef(M, {"c": nnx.GraphDef(nnx.List, {}, {})}, {})
-    s = nnx.State({"c.somevar": nnx.Param(2)})
-
-    m2 = g.merge(s)
-    assert hasattr(m2, "c")
-
-    g2, *s2 = nnx.split(m, nnx.Param)
-    assert g2 is not None
+    e2 = Einsum(
+        "ab,bc",
+        (3, 4),
+        None,
+        kernel_init=initializers.ones,
+        bias_init=initializers.zeros,
+    )
+    assert e2(x).shape == (2, 4)
 
 
-def test_module_missing_paths4():
-    class M(nnx.Module):
-        def __init__(self):
-            super().__init__()
-            self.p = nnx.Param(1)
+def test_missing_reexports() -> None:
+    """Verify all compatibility re-exports on zero_flax.nnx.missing and filter composition."""
+    f = filterlib.Filter()
+    assert f(("a",), variables.Param(1))
+    e = filterlib.Everything()
+    assert e(("a",), variables.Param(1))
+    n = filterlib.Nothing()
+    assert not n(("a",), variables.Param(1))
+    pc = filterlib.PathContains("kernel")
+    assert pc(("l1", "kernel"), variables.Param(1))
+    ot = filterlib.OfType(variables.Param)
+    assert ot(("p",), variables.Param(1))
+    a = ot & pc
+    assert a(("kernel",), variables.Param(1))
+    af = ot | n
+    assert af(("p",), variables.Param(1))
+    nt = ~n
+    assert nt(("p",), variables.Param(1))
+    seq_pred = filterlib.to_predicate([variables.Param, variables.BatchStat])
+    assert seq_pred(("p",), variables.Param(1))
 
-    m = M()
-    g, s = nnx.split(m)
-    m2 = g.merge((s,))
-    assert m2.p.value == 1
+    v = variables.Variable(1)
+    assert v.replace(2).value == 2
+    assert v.copy().value == 1
+    p = variables.Param(2)
+    b = variables.BatchStat(3)
+    c = variables.Cache(4)
+    i = variables.Intermediate(5)
+    lp = nnx.LoRAParam(6)
+    assert (p.value, b.value, c.value, i.value, lp.value) == (2, 3, 4, 5, 6)
+
+    rs = rnglib.RngState(1)
+    rc = rnglib.RngCount(2)
+    rk = rnglib.RngKey(nnx.Rngs(0)())
+    assert rs.value == 1 and rc.value == 2 and rk.value is not None
+
+    stream = rnglib.RngStream(0)
+    assert stream() is not None
+    r = rnglib.Rngs(0, params=1)
+    assert r() is not None
+    assert r.default() is not None
+    assert r.params() is not None
+    assert r.dropout() is not None
+    assert r["params"] is not None
+
+    dg = nnx.DotGeneralT()
+    assert dg(
+        np.ones((2, 3)),
+        np.ones((3, 2)),
+        (((1,), (0,)), ((), ())),
+        preferred_element_type="float32",
+    ).shape == (2, 2)
+    init = nnx.Initializer()
+    assert init(None, (2, 2)).shape == (2, 2)
+    mf = nnx.MaxFun()
+    assert mf(np.array([1.0, 3.0]), np.array([2.0, 1.0])).shape == (2,)
+    assert float(np.asarray(mf(np.array([1.0, 3.0])))) == 3.0
 
 
-def test_module_missing_paths5():
-    class M(nnx.Module):
-        def __init__(self):
-            super().__init__()
-            self.p = nnx.Param(1)
+def test_module_without_super_init() -> None:
+    """Verify Module subclass that omits super().__init__() still initializes registries via register_variable."""
 
-    m = M()
-    g, s1, s2 = nnx.split(m, nnx.Param)
+    class RawSubModule(nnx.Module):
+        """Module subclass registering a variable without calling super().__init__()."""
+
+        p: state.Param[int]
+
+        def __init__(self) -> None:
+            """Register ``self.p = Param(1)`` without ``super().__init__()``."""
+            self.p = self.register_variable("p", state.Param(1))
+
+    m = RawSubModule()
+    st = m.state()
+    assert "p" in st
+    m.update(state.State({"p": state.Param(99)}))
+    assert m.p.value == 99
+
+    gdef, st_split = nnx.split(m)
+    m_reconstructed = nnx.merge(gdef, st_split)
+    assert m_reconstructed.p.value == 99
+
+    merged_states = nnx.merge(state.State({"a": 1}), state.State({"b": 2}))
+    assert merged_states["a"] == 1 and merged_states["b"] == 2
 
 
-def test_merge_state_fallback():
-    s1 = nnx.State({"a": nnx.Param(1)})
-    s2 = nnx.State({"b": nnx.Param(2)})
-    s_merged = nnx.merge(s1, s2)
-    assert s_merged["a"].value == 1
-    assert s_merged["b"].value == 2
+def test_normalization_and_stochastic_variants() -> None:
+    """Verify BatchNorm, LayerNorm, RMSNorm, and Dropout with custom initializers and broadcast_dims."""
+    x = np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], dtype=np.float32)
 
+    bn = nnx.BatchNorm(
+        3,
+        rngs=rnglib.Rngs(0),
+        scale_init=initializers.ones,
+        bias_init=initializers.zeros,
+    )
+    assert bn(x, use_running_average=False).shape == (2, 3)
+    assert bn(x, use_running_average=True).shape == (2, 3)
 
-def test_module_missing_paths6():
-    m = nnx.Module()
-    m.v1 = nnx.Param(1)
-    m.v2 = nnx.BatchStat(2)
-    g, s1, s2, s3 = nnx.split(m, nnx.Param, nnx.BatchStat)
-    assert g is not None
-    assert s1 is not None
-
-
-def test_normalization():
-    x = np.random.normal(size=(2, 3))
-
-    ln = nnx.LayerNorm(3, rngs=rnglib.Rngs(0))
+    ln = nnx.LayerNorm(3, use_scale=False, use_bias=False)
     assert ln(x).shape == (2, 3)
 
-    rn = nnx.RMSNorm(3, rngs=rnglib.Rngs(0))
+    rn = nnx.RMSNorm(3, use_scale=False)
     assert rn(x).shape == (2, 3)
+
+    d = nnx.Dropout(0.5, broadcast_dims=(0,), deterministic=False, rngs=rnglib.Rngs(0))
+    assert d(x).shape == (2, 3)

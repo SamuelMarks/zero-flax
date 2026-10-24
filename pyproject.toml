@@ -5,16 +5,35 @@ build-backend = "hatchling.build"
 [project]
 name = "zero-flax"
 version = "0.8.5"
-description = "Zero-dependency pure Python implementation of the Flax NNX API surface."
-authors = [{ name = "Samuel Marks" }]
+description = "Zero-dependency pure Python implementation of the Flax NNX neural network library."
+readme = "README.md"
 requires-python = ">=3.9"
-dynamic = ["dependencies"]
-
-[project.optional-dependencies]
-test = [
-    "pytest",
-    "pytest-cov",
+license = { text = "Apache-2.0 OR MIT" }
+authors = [
+    { name = "Samuel Marks", email = "samuelmarks@gmail.com" },
 ]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dynamic = ["dependencies", "optional-dependencies"]
+
+[project.urls]
+Homepage = "https://github.com/SamuelMarks/zero-flax"
+Repository = "https://github.com/SamuelMarks/zero-flax"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/zero_flax"]
 
 [tool.hatch.metadata]
 allow-direct-references = true
@@ -22,14 +41,65 @@ allow-direct-references = true
 [tool.hatch.metadata.hooks.requirements_txt]
 files = ["requirements.txt"]
 
-dependencies = []
+[tool.hatch.metadata.hooks.requirements_txt.optional-dependencies]
+test = ["requirements-test.txt"]
+
+[tool.ruff]
+target-version = "py39"
+line-length = 100
 
 [tool.ruff.lint]
-ignore = ['E402', 'F401', 'F841', 'E741', 'E501']
+select = ["E", "F", "I", "UP", "B", "SIM", "ANN", "D", "RET"]
+ignore = ["E501", "UP006", "UP007", "UP035", "UP045", "ANN401", "D418"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
 
 [tool.pytest.ini_options]
-pythonpath = "src"
-addopts = "--cov=src --cov-fail-under=80"
+pythonpath = ["src"]
+addopts = "--cov=src/zero_flax --cov=scripts --cov-branch --cov-report=term-missing --cov-fail-under=100"
+
+[tool.coverage.run]
+branch = true
+source = ["src/zero_flax", "scripts"]
+
+[tool.coverage.report]
+fail_under = 100
+show_missing = true
+exclude_lines = [
+    'if __name__ == .__main__.:',
+    'if TYPE_CHECKING:',
+    '\.\.\.',
+]
+
+[tool.interrogate]
+ignore-init-method = false
+ignore-init-module = false
+ignore-magic = false
+ignore-module = false
+ignore-private = false
+ignore-semiprivate = false
+ignore-property-decorators = false
+fail-under = 100
+verbose = 2
+exclude = ["build", "dist", ".git", ".venv"]
 
 [tool.mypy]
+python_version = "3.9"
+mypy_path = "src"
+files = ["src", "scripts", "tests"]
+strict = true
 ignore_missing_imports = true
+disallow_any_explicit = true
+disallow_any_generics = true
+disallow_subclassing_any = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+disallow_untyped_decorators = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_return_any = true
+warn_unreachable = true
+strict_equality = true

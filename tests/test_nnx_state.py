@@ -1,78 +1,88 @@
-"""Tests for zero_flax.nnx State class initialization and mutation tracking."""
+"""Tests for `zero_flax.nnx` `State` initialization, splitting, merging, and mutation tracking."""
 
-from zero_flax.nnx import Module, Param, BatchStat, State, merge
+from __future__ import annotations
+
+from zero_flax.nnx import BatchStat, Module, Param, State, merge
 
 
 class MyModule(Module):
-    def __init__(self):
+    """Sample module containing a `Param`, a `BatchStat`, and a static integer."""
+
+    p: Param[int]
+    b: BatchStat[int]
+    static: int
+
+    def __init__(self) -> None:
+        """Initialize MyModule with ``p=1``, ``b=2``, and ``static=3``."""
         super().__init__()
-        self.p1 = Param(1.0)
-        self.b1 = BatchStat(0.0)
-        self._is_initializing = False
+        self.p = self.register_variable("p", Param(1))
+        self.b = self.register_variable("b", BatchStat(2))
+        self.static = 3
+        self.finish_init()
 
 
-def test_nnx_state_initialization():
+def test_state_extraction() -> None:
+    """Verify Module.state() extracts Variables while excluding static fields."""
     m = MyModule()
-    state = m.state()
-    assert "p1" in state
-    assert "b1" in state
-    assert state["p1"].value == 1.0
+    s = m.state()
+    assert "p" in s
+    assert "b" in s
+    assert "static" not in s
+    assert isinstance(s["p"], Param)
+    assert s["p"].value == 1
+    assert isinstance(s["b"], BatchStat)
+    assert s["b"].value == 2
 
 
-def test_nnx_mutation_tracking():
+def test_state_mutation() -> None:
+    """Verify Module.update() mutates existing Variable values in-place."""
     m = MyModule()
-    m.p1.value = 2.0
-    state = m.state()
-    assert state["p1"].value == 2.0
-
-    # Test split and merge
-    params, stats, rest = state.split(Param, BatchStat)
-    assert "p1" in params
-    assert "b1" in stats
-    assert "p1" not in stats
-
-    merged = merge(params, stats)
-    assert "p1" in merged
-    assert "b1" in merged
+    s = m.state()
+    s["p"] = Param(10)
+    m.update(s)
+    assert m.p.value == 10
 
 
-def test_nnx_state_coverage():
-    from zero_flax.nnx.state import Variable, Param, State
+def test_state_split_and_merge() -> None:
+    """Verify State.split() and merge() partition and recombine Variable types."""
+    m = MyModule()
+    s = m.state()
+    params, batch_stats, rest = s.split(Param, BatchStat)
+    assert "p" in params
+    assert "b" not in params
+    assert "b" in batch_stats
+    assert "p" not in batch_stats
+    assert len(rest) == 0
 
-    v = Variable(5)
-    assert repr(v) == "Variable(5)"
-
-    # State split remainder coverage
-    s = State({"v": Variable(1), "n": 5})
-    res = s.split(Param)
-    assert len(res) == 2
-    assert "n" in res[1]
+    merged = merge(params, batch_stats, rest)
+    assert "p" in merged
+    assert "b" in merged
 
 
-def test_nnx_module_coverage():
-    from zero_flax.nnx import Module, Param
-    import pytest
+def test_nested_module() -> None:
+    """Verify hierarchical State extraction and update on nested Modules."""
 
-    class M(Module):
-        def __init__(self):
+    class ParentModule(Module):
+        """Parent module wrapping a child MyModule."""
+
+        p: Param[int]
+        m2: MyModule
+
+        def __init__(self) -> None:
+            """Initialize ParentModule with ``p=0`` and child ``m2``."""
             super().__init__()
-            self._x = 5
-            self.p = Param(1)
-            self.m2 = Module()
-            self.m2.p2 = Param(2)
-            super().__setattr__("_is_initializing", False)
+            self.p = self.register_variable("p", Param(0))
+            self.m2 = self.register_child("m2", MyModule())
+            self.finish_init()
 
-    m = M()
-
-    with pytest.raises(ValueError):
-        m.new_attr = 5
-
+    m = ParentModule()
     s = m.state()
     assert "p" in s
     assert "m2" in s
-    assert "p2" in s["m2"]
+    assert isinstance(s["m2"], State)
+    assert "p" in s["m2"]
 
-    new_s = State({"p": Param(10), "m2": State({"p2": Param(20)})})
+    new_s = State({"p": Param(10), "m2": State({"p": Param(20)})})
     m.update(new_s)
     assert m.p.value == 10
-    assert m.m2.p2.value == 20
+    assert m.m2.p.value == 20

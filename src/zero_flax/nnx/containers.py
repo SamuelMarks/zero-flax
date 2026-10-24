@@ -1,110 +1,282 @@
-from __future__ import annotations
+"""Container modules (`Dict`, `List`, `Sequential`) for the zero-flax NNX API.
 
-"""Container modules for neural networks.
-
-This module provides standard container modules like Dict, List, and Sequential
-that inherit from Module and can be used to group other modules or elements.
+This module implements standard container modules that inherit from `Module`
+and automatically register child `Module` and `Variable` entries into the
+parent module registries without dynamic reflection or `Any`.
 """
 
+from __future__ import annotations
+
+from collections.abc import Callable, Iterable, Iterator, Mapping
+from typing import Generic, Optional, Protocol, Tuple, TypeVar, Union, runtime_checkable
+
+from typing_extensions import TypeAlias, TypeGuard
+
 from zero_flax.nnx.module import Module
-from typing import Iterable, Callable, Any, TypeVar
+from zero_flax.nnx.variables import Variable, VariableValue
+from zero_flax.types import ArrayLike, JaxArray
 
-A = TypeVar("A")
+
+@runtime_checkable
+class LayerCallableProtocol(Protocol):
+    """Protocol for sequential layer callables accepting an input array."""
+
+    def __call__(
+        self,
+        x: ArrayLike,
+        *args: ArrayLike,
+        **kwargs: ArrayLike,
+    ) -> ArrayLike:
+        """Transform ``x`` and return an ``ArrayLike`` output.
+
+        Args:
+            x: Input array or scalar.
+            *args: Optional additional positional arguments.
+            **kwargs: Optional additional keyword arguments.
+
+        Returns:
+            Transformed output.
+        """
 
 
-class Dict(Module, dict[str, Any]):
-    """A dictionary-like container module.
+ContainerItem: TypeAlias = Union[
+    Module,
+    Variable[VariableValue],
+    LayerCallableProtocol,
+    JaxArray,
+    ArrayLike,
+    int,
+    float,
+    str,
+    bool,
+    None,
+]
+ItemT = TypeVar("ItemT", bound=ContainerItem)
 
-    This module acts as a standard Python dictionary but also registers its
-    contents as submodules if they are Module instances.
+
+class Dict(Module, Generic[ItemT]):
+    """Dictionary container module registering ``Module`` and ``Variable`` values in NNX state.
+
+    Attributes:
+        _data: Internal dictionary mapping string keys to container items.
     """
 
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        """Initializes the Dict container.
+    _data: dict[str, ItemT]
+
+    def __init__(
+        self,
+        *args: Union[Mapping[str, ItemT], Iterable[Tuple[str, ItemT]]],
+        **kwargs: ItemT,
+    ) -> None:
+        """Initialize a Dict module from an optional mapping/iterable and keyword entries.
 
         Args:
-            *args: Positional arguments passed to the underlying dict constructor.
-            **kwargs: Keyword arguments passed to the underlying dict constructor.
+            *args: At most one mapping or iterable of ``(key, value)`` pairs.
+            **kwargs: Additional key-value entries to store in the container.
         """
         super().__init__()
-        dict.__init__(self, *args, **kwargs)
+        self._data = {}
+        for arg in args:
+            if isinstance(arg, Mapping):
+                for k, v in arg.items():
+                    self[k] = v
+            else:
+                for k, v in arg:
+                    self[k] = v
+        for k, v in kwargs.items():
+            self[k] = v
+        self.finish_init()
 
-    def __call__(self, *args: Any, **kwargs: Any) -> Any:
-        """Allows calling the Dict module directly.
+    def __setitem__(self, key: str, value: ItemT) -> None:
+        """Store ``value`` under ``key`` and register it if it is a ``Module`` or ``Variable``.
 
         Args:
-            *args: Positional arguments (ignored).
-            **kwargs: Keyword arguments (ignored).
+            key: String dictionary key.
+            value: Item to store.
+        """
+        self._ensure_registries()
+        self._data[key] = value
+        if isinstance(value, Module):
+            self.register_child(str(key), value)
+        elif isinstance(value, Variable):
+            self.register_variable(str(key), value)
+
+    def __getitem__(self, key: str) -> ItemT:
+        """Retrieve the item stored under ``key``.
+
+        Args:
+            key: String dictionary key.
 
         Returns:
-            Always returns None.
+            Stored item.
         """
-        return None
+        return self._data[key]
+
+    def __contains__(self, key: str) -> bool:
+        """Check whether ``key`` is present in the Dict container.
+
+        Args:
+            key: String dictionary key to check.
+
+        Returns:
+            ``True`` if ``key`` exists in ``self._data``.
+        """
+        return key in self._data
+
+    def __iter__(self) -> Iterator[str]:
+        """Iterate over the keys of the Dict container.
+
+        Returns:
+            Iterator over dictionary keys.
+        """
+        return iter(self._data)
+
+    def __len__(self) -> int:
+        """Return the number of entries in the Dict container.
+
+        Returns:
+            Number of stored entries.
+        """
+        return len(self._data)
 
 
-class List(Module, list[Any]):
-    """A list-like container module.
+class List(Module, list[ItemT], Generic[ItemT]):
+    """List container module registering ``Module`` and ``Variable`` elements in NNX state.
 
-    This module acts as a standard Python list but also registers its
-    contents as submodules if they are Module instances.
+    Attributes:
+        _pytree__has_int_keys: Internal Flax NNX pytree compatibility flag.
     """
 
-    def __init__(self, elems: Iterable[A] = (), /):
-        """Initializes the List container.
+    _pytree__has_int_keys: bool
+
+    def __init__(
+        self,
+        it: Optional[Iterable[ItemT]] = None,
+        /,
+        *,
+        _pytree__has_int_keys: bool = True,
+    ) -> None:
+        """Initialize a List module from an optional iterable of items.
 
         Args:
-            elems: An iterable of elements to initialize the list with.
+            it: Optional iterable of elements to populate the list.
+            _pytree__has_int_keys: Pytree integer-key marker matching ``flax.nnx.List``.
         """
-        super().__init__()
-        list.__init__(self, elems)
+        Module.__init__(self)
+        list.__init__(self)
+        self._pytree__has_int_keys = bool(_pytree__has_int_keys)
+        if it is not None:
+            for item in it:
+                self.append(item)
+        self.finish_init()
 
-    def __iter__(self) -> Any:
-        """Returns an iterator over the elements in the List.
-
-        Returns:
-            An iterator object.
-        """
-        return list.__iter__(self)
-
-    def __getitem__(self, idx: Any) -> Any:
-        """Retrieves an element at the given index.
+    def _register_indexed_item(self, index: int, value: ItemT) -> None:
+        """Register ``value`` under its stringified integer index if it is a ``Module`` or ``Variable``.
 
         Args:
-            idx: The index of the element to retrieve.
-
-        Returns:
-            The element at the specified index.
+            index: Non-negative integer element index.
+            value: Element value.
         """
-        return list.__getitem__(self, idx)
+        self._ensure_registries()
+        key = str(index)
+        if isinstance(value, Module):
+            self.register_child(key, value)
+        elif isinstance(value, Variable):
+            self.register_variable(key, value)
+
+    def append(self, value: ItemT) -> None:
+        """Append ``value`` to the end of the list and register it in module state.
+
+        Args:
+            value: Element to append.
+        """
+        idx = len(self)
+        super().append(value)
+        self._register_indexed_item(idx, value)
+
+    def extend(self, values: Iterable[ItemT]) -> None:
+        """Extend the list by appending all elements from ``values``.
+
+        Args:
+            values: Iterable of elements to append.
+        """
+        for val in values:
+            self.append(val)
+
+
+SequentialLayer: TypeAlias = Union[
+    Module,
+    LayerCallableProtocol,
+    Callable[[ArrayLike], ArrayLike],
+    Callable[[Union[int, float]], Union[int, float]],
+    Callable[[float, float], float],
+]
+
+
+def _as_layer_callable(fn: SequentialLayer) -> TypeGuard[LayerCallableProtocol]:
+    """Narrow a ``SequentialLayer`` to ``LayerCallableProtocol``.
+
+    Args:
+        fn: Candidate sequential layer or callable.
+
+    Returns:
+        Always ``True`` for valid sequential layers.
+    """
+    return callable(fn)
 
 
 class Sequential(Module):
-    """A sequential container module.
+    """Sequential container module chaining a sequence of layers or callables.
 
-    This module sequences together a list of callable objects (usually Modules),
-    passing the output of one as the input to the next.
+    Attributes:
+        layers: List of callable layers or functions executed in order.
+        fns: Alias for ``layers`` for Flax NNX compatibility.
     """
 
-    def __init__(self, *fns: Callable[..., Any]) -> None:
-        """Initializes the Sequential container.
+    layers: list[SequentialLayer]
+    fns: Tuple[SequentialLayer, ...]
+
+    def __init__(self, *fns: SequentialLayer) -> None:
+        """Initialize a Sequential container with a variable number of callables or modules.
 
         Args:
-            *fns: A variable number of callable objects to sequence together.
+            *fns: Layers or functions to apply sequentially.
         """
         super().__init__()
-        self.fns = fns
+        self.fns = tuple(fns)
+        self.layers = list(fns)
+        for idx, fn in enumerate(fns):
+            if isinstance(fn, Module):
+                self.register_child(f"layer_{idx}", fn)
+        self.finish_init()
 
-    def __call__(self, x: Any, *args: Any, **kwargs: Any) -> Any:
-        """Applies the sequenced functions to the input.
+    def __call__(
+        self,
+        x: ArrayLike,
+        *args: ArrayLike,
+        **kwargs: ArrayLike,
+    ) -> ArrayLike:
+        """Apply all layers in ``self.layers`` sequentially to ``x``.
 
         Args:
-            x: The initial input tensor or value.
-            *args: Additional positional arguments passed to each function.
-            **kwargs: Additional keyword arguments passed to each function.
+            x: Initial input array passed to the first layer.
+            *args: Additional positional arguments forwarded to each layer.
+            **kwargs: Additional keyword arguments forwarded to each layer.
 
         Returns:
-            The final output after applying all functions in sequence.
+            Final output produced by the last layer in the sequence.
         """
-        for fn in self.fns:
-            x = fn(x, *args, **kwargs)
-        return x
+        cur: ArrayLike = x
+        for fn in self.layers:
+            if _as_layer_callable(fn):
+                cur = fn(cur, *args, **kwargs) if (args or kwargs) else fn(cur)
+        return cur
+
+
+__all__ = [
+    "ContainerItem",
+    "Dict",
+    "ItemT",
+    "List",
+    "Sequential",
+]

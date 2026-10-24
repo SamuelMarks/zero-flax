@@ -3,45 +3,59 @@ repos:
     hooks:
       - id: ruff-format
         name: Ruff Format
-        entry: ruff format .
+        entry: ruff format --check .
         language: system
         types: [python]
         pass_filenames: false
 
       - id: ruff-check
-        name: Ruff Check (Fix)
-        entry: ruff check --fix .
+        name: Ruff Check
+        entry: ruff check .
         language: system
         types: [python]
         pass_filenames: false
 
-      - id: pytest-coverage
-        name: Run Pytest Coverage
-        entry: pytest --cov=. --cov-report=term-missing
+      - id: mypy
+        name: Mypy Type Check
+        entry: mypy --strict src scripts tests
         language: system
         types: [python]
         pass_filenames: false
 
-      - id: api-compliance
-        name: API Compliance Check
-        entry: ml_framework_snapshots check flax src/zero_flax --reference-prefix flax --target-prefix zero_flax
+      - id: lint-typing
+        name: Strict Typing & Reflection Lint
+        entry: python3 scripts/lint_typing.py
         language: system
+        types: [python]
         pass_filenames: false
 
-      - id: check-3rdparty-deps
-        name: Check 3rd-party Dependencies
+      - id: check-docs
+        name: AST Docstring Coverage Check
+        entry: python3 scripts/check_docs.py
+        language: system
+        types: [python]
+        pass_filenames: false
+
+      - id: interrogate
+        name: Interrogate Docstring Check
+        entry: interrogate -vv -f 100 -M -i -c pyproject.toml src scripts tests
+        language: system
+        types: [python]
+        pass_filenames: false
+
+      - id: check-deps
+        name: Check 3rd-Party Dependencies
         entry: python3 scripts/check_deps.py
         language: system
-        types: [python]
-        files: ^src/
-
-      - id: update-badges
-        name: Update Coverage Shields
-        entry: python3 scripts/update_badges.py
-        language: system
-        types: [python]
+        files: ^src/.*\.py$
         pass_filenames: false
 
+      - id: check-api-compliance
+        name: Check API Compliance
+        entry: python3 scripts/check_compliance.py
+        language: system
+        files: ^(SEMANTIC_PLAN\.md|src/.*\.py)$
+        pass_filenames: false
 
       - id: check-compiler-tests
         name: Check Compiler Parity Tests
@@ -50,16 +64,22 @@ repos:
         pass_filenames: false
 
       - id: check-parity-tests
-        name: Check Parity Tests
+        name: Check Semantic Parity Tests
         entry: python3 scripts/check_parity_tests.py
         language: system
         pass_filenames: false
 
-      - id: check-api-compliance
-        name: Check API Conformance
-        entry: env PYTHONPATH=src:../ml-switcheroo-compiler/src:../zero-jax/src:../zero-optax/src python3 scripts/check_compliance.py
+      - id: pytest-coverage
+        name: Pytest 100% Branch Coverage
+        entry: pytest --cov=src/zero_flax --cov=scripts --cov-branch --cov-report=term-missing --cov-fail-under=100
         language: system
-        files: ^(SEMANTIC_PLAN\.md|src/.*\.py)$
+        types: [python]
+        pass_filenames: false
+
+      - id: update-badges
+        name: Update README Badges
+        entry: python3 scripts/update_badges.py
+        language: system
         pass_filenames: false
 
       - id: build

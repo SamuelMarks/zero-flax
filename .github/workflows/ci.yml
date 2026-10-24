@@ -13,51 +13,89 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v4
       with:
-        path: 'zero-flax'
+        path: zero-flax
 
-    - name: Set up Python
-      uses: actions/setup-python@v6
+    - name: Checkout ml-switcheroo-ir
+      uses: actions/checkout@v4
       with:
-        python-version: '3.12'
+        repository: SamuelMarks/ml-switcheroo-ir
+        path: ml-switcheroo-ir
 
-    - name: Install Dependencies
+    - name: Checkout ml-switcheroo-compiler
+      uses: actions/checkout@v4
+      with:
+        repository: SamuelMarks/ml-switcheroo-compiler
+        path: ml-switcheroo-compiler
+
+    - name: Checkout zero-jax
+      uses: actions/checkout@v4
+      with:
+        repository: SamuelMarks/zero-jax
+        path: zero-jax
+
+    - name: Checkout zero-chex
+      uses: actions/checkout@v4
+      with:
+        repository: SamuelMarks/zero-chex
+        path: zero-chex
+
+    - name: Checkout zero-optax
+      uses: actions/checkout@v4
+      with:
+        repository: SamuelMarks/zero-optax
+        path: zero-optax
+
+    - name: Set up Python 3.11
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.11"
+
+    - name: Install dependencies
       working-directory: zero-flax
       run: |
         python -m pip install --upgrade pip
-        pip install ruff pytest pytest-cov build flax ml_framework_snapshots
-        if [ -f "pyproject.toml" ]; then pip install -e .[test] || true; fi
-        if [ -f "requirements.txt" ]; then pip install -r requirements.txt || true; fi
+        pip install ruff mypy interrogate build pytest pytest-cov pydantic
+        pip install "https://github.com/SamuelMarks/ml-ecosystem-snapshots/releases/download/v0.0.4/ml_ecosystem_snapshots-0.0.4-py3-none-any.whl"
+        pip install -e ../ml-switcheroo-ir
+        pip install -e ../ml-switcheroo-compiler
+        pip install -e ../zero-jax
+        pip install -e ../zero-chex
+        pip install -e ../zero-optax
+        pip install -r requirements-test.txt
+        pip install --no-deps -e .
 
-    - name: Check Code Formatting (Ruff)
-      working-directory: zero-flax
-      run: ruff format --check .
-
-    - name: Check Linting (Ruff)
-      working-directory: zero-flax
-      run: ruff check .
-
-    - name: Test & Coverage
+    - name: Run Ruff Format & Lint
       working-directory: zero-flax
       run: |
-        pytest --cov=. --cov-report=xml
-        
-    - name: Compliance Check
+        ruff format --check .
+        ruff check .
+
+    - name: Run Mypy & Strict Typing Linter
       working-directory: zero-flax
       run: |
-        ml_framework_snapshots check flax src/zero_flax --reference-prefix flax --target-prefix zero_flax
-        python scripts/check_compiler_tests.py
-        python scripts/check_parity_tests.py
-        
-    - name: Update Badges
+        python3 scripts/lint_typing.py
+        mypy --strict src scripts tests
+
+    - name: Check Docstring Coverage (100%)
       working-directory: zero-flax
       run: |
-        python scripts/update_badges.py
-        if ! git diff --exit-code README.md; then
-          echo "Coverage badges in README.md are out of date. Please run pre-commit or the update badges script locally and commit the changes."
-          exit 1
-        fi
+        python3 scripts/check_docs.py
+        interrogate -vv -f 100 -M -i -c pyproject.toml src scripts tests
+
+    - name: Check Dependency Isolation & API Compliance
+      working-directory: zero-flax
+      run: |
+        python3 scripts/check_deps.py
+        python3 scripts/check_compliance.py
+        python3 scripts/check_compiler_tests.py
+        python3 scripts/check_parity_tests.py
+
+    - name: Run Pytest (100% Line & Branch Coverage)
+      working-directory: zero-flax
+      run: |
+        pytest --cov=src/zero_flax --cov=scripts --cov-branch --cov-report=term-missing --cov-fail-under=100
 
     - name: Build Package
       working-directory: zero-flax

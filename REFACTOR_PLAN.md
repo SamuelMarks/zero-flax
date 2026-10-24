@@ -11,6 +11,7 @@ Refactor `zero-flax` to depend heavily on its native sibling packages, eliminati
   - `pydantic`
   - `../cdd-python`
   - `../ml-switcheroo-ir`
+  - `../ml-ecosystem-snapshots`
   - `../ml-switcheroo-compiler`
   - `../zero-jax`
   - `../zero-grain`

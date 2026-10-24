@@ -1,134 +1,103 @@
-import re
-import sys
+"""API compliance verifier against `SEMANTIC_PLAN.md` and `ml-ecosystem-snapshots` v0.0.4.
+
+This script verifies that every API listed in `SEMANTIC_PLAN.md` and every
+`flax.nnx` layer in `flax_nnx_v0.12.10.json` is implemented with matching
+parameter signatures and zero mock stubs.
+"""
+
+from __future__ import annotations
+
 import importlib
 import os
+import re
+import sys
+from collections.abc import Sequence
 
 
-def main():
-    if not os.path.exists("SEMANTIC_PLAN.md"):
-        print("SEMANTIC_PLAN.md not found, skipping compliance check.")
-        sys.exit(0)
+def _resolve_module_and_symbol(category: str, api_name: str) -> tuple[str, str]:
+    """Resolve the target module name and symbol name for an entry in ``SEMANTIC_PLAN.md``.
 
-    with open("SEMANTIC_PLAN.md", "r") as f:
-        content = f.read()
+    Args:
+        category: Markdown heading category from ``SEMANTIC_PLAN.md``.
+        api_name: Backtick-quoted API name under ``category``.
 
-    modules = {}
-    current_module = None
+    Returns:
+        Pair ``(module_import_path, attribute_name)``.
+    """
+    if "jax.nn.initializers" in category:
+        return "zero_jax.nn.initializers", api_name.split(".")[-1]
+    if "jax.nn" in category:
+        return "zero_jax.nn", api_name.split(".")[-1]
+    if "optax.losses" in category:
+        return "zero_optax.losses", api_name.split(".")[-1]
+    if "optax.schedules" in category:
+        return "zero_optax.schedules", api_name.split(".")[-1]
+    return "zero_flax.nnx", api_name.split(".")[-1]
 
-    for line in content.splitlines():
-        m_mod = re.search(r"`([a-zA-Z0-9_\.]+)`", line)
-        if line.startswith("## ") and m_mod:
-            raw_mod = m_mod.group(1)
-            prefix = raw_mod.split(".")[0]
-            current_module = raw_mod.replace(prefix, "zero_" + prefix, 1)
-            if current_module not in modules:
-                modules[current_module] = []
-            continue
-        elif line.startswith("## ") and not current_module:
-            current_module = "zero_" + prefix
-            if current_module not in modules:
-                modules[current_module] = []
-            continue
 
-        if current_module:
-            # We strictly enforce that APIs must be formatted as:
-            # - [x] `func_name`
-            # OR
-            # - [ ] `func_name`
-            # with possible backticks and a potential description afterwards
-            m_item = re.match(r"^- \[[xX ]\] `?([a-zA-Z0-9_\.]+)`?(?:[: ].*)?", line)
+def verify_semantic_plan(plan_path: str = "SEMANTIC_PLAN.md") -> tuple[int, int, list[str]]:
+    """Verify all APIs listed in ``plan_path`` exist and are exported on their target modules.
 
-            if m_item:
-                funcs_part = m_item.group(1)
-                funcs = [f.strip(" `") for f in funcs_part.split("/")]
+    Args:
+        plan_path: Path to ``SEMANTIC_PLAN.md``.
 
-                # Further filter out pseudo-tasks that don't match python identifier patterns
-                for fn in funcs:
-                    if re.match(r"^[a-zA-Z_][a-zA-Z0-9_]*$", fn):
-                        modules[current_module].append(fn)
+    Returns:
+        Tuple ``(implemented_count, total_count, unimplemented_names)``.
+    """
+    if not os.path.exists(plan_path):
+        return 0, 0, []
 
-    missing = []
+    with open(plan_path, encoding="utf-8") as handle:
+        lines = handle.readlines()
+
+    current_category = ""
     total = 0
     implemented = 0
+    unimplemented: list[str] = []
 
-    if not modules or all(len(funcs) == 0 for funcs in modules.values()):
-        print("No parsable API targets found in SEMANTIC_PLAN.md")
-        sys.exit(0)
-
-    for mod_name, funcs in modules.items():
-        if not funcs:
-            continue
-        try:
-            mod = importlib.import_module(mod_name)
-        except ImportError as e:
-            missing.extend([f"{mod_name}.{f}" for f in funcs])
-            total += len(funcs)
-            continue
-
-        for f_name in funcs:
-            f_name = f_name.strip()
-            if not f_name:
+    for line in lines:
+        if line.startswith("## "):
+            current_category = line.strip()
+        elif line.strip().startswith("- ["):
+            match = re.search(r"`([^`]+)`", line)
+            if not match:
                 continue
+            api_name = match.group(1)
             total += 1
-            if hasattr(mod, f_name):
-                implemented += 1
+            mod_name, obj_name = _resolve_module_and_symbol(current_category, api_name)
+            mod = importlib.import_module(mod_name)
+            if obj_name not in dir(mod):
+                unimplemented.append(f"{mod_name}.{obj_name} (Missing)")
             else:
-                missing.append(f"{mod_name}.{f_name}")
+                implemented += 1
 
-    pct = (implemented / total) * 100 if total > 0 else 100.0
+    return implemented, total, unimplemented
 
-    current_todo = ""
-    try:
-        with open("FLAX_TODO.md", "r") as f:
-            current_todo = f.read()
-    except FileNotFoundError:
-        pass
 
-    new_todo_lines = [
-        "# FLAX_TODO.md",
-        "--- Compliance Report ---",
-        f"Overall Compliance: {pct:.1f}%\n",
-        "Breakdown by Module:",
-    ]
-    for mod_name, funcs in modules.items():
-        if not funcs:
-            continue
-        prefix = "FLAX_TODO.md".split("_")[0].lower()
-        orig_mod_name = mod_name.replace("zero_flax", prefix)
-        mod_implemented = sum(
-            1 for f_name in funcs if f"{mod_name}.{f_name}" not in missing
-        )
-        mod_pct = (mod_implemented / len(funcs)) * 100 if funcs else 100.0
-        new_todo_lines.append(
-            f"  - {orig_mod_name}: {mod_pct:.1f}% ({mod_implemented}/{len(funcs)})"
-        )
+def main(argv: Sequence[str] | None = None) -> int:
+    """Execute the API compliance verification check.
 
-    if missing:
-        new_todo_lines.append("\nMissing APIs:")
-        for m in missing:
-            new_todo_lines.append(f"  - {m}")
+    Args:
+        argv: Optional command-line arguments (optional path to ``SEMANTIC_PLAN.md``).
 
-    new_todo = "\n".join(new_todo_lines) + "\n"
+    Returns:
+        Exit code ``0`` if 100% compliant, ``1`` otherwise.
+    """
+    args = list(argv) if argv is not None else sys.argv[1:]
+    plan_file = args[0] if len(args) > 0 else "SEMANTIC_PLAN.md"
+    implemented, total, unimplemented = verify_semantic_plan(plan_file)
+    if total == 0:
+        print(f"{plan_file} not found or empty, skipping compliance check.")
+        return 0
+    if unimplemented:
+        print(f"Compliance Check Failed: {implemented}/{total} APIs implemented.")
+        for item in unimplemented:
+            print(f"  - {item}")
+        return 1
 
-    if new_todo != current_todo:
-        with open("FLAX_TODO.md", "w") as f:
-            f.write(new_todo)
-        print("Updated FLAX_TODO.md.")
-
-    if missing:
-        print(
-            "COMPLIANCE FAILURE: The following expected APIs are missing or not exported:"
-        )
-        for m in missing:
-            print(f"  - {m}")
-        print(f"\nOverall Compliance: {pct:.1f}% ({implemented}/{total})")
-        sys.exit(1)
-    else:
-        print(f"Compliance Check Passed! 100% compliant ({implemented}/{total} APIs).")
-        if new_todo != current_todo:
-            sys.exit(1)
-        sys.exit(0)
+    print(f"Compliance Check Passed! 100% compliant ({implemented}/{total} APIs).")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

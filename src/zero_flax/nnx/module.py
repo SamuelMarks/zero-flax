@@ -1,233 +1,472 @@
-from __future__ import annotations
+"""Reflection-free base Module, GraphDef, split, and merge system for zero-flax NNX.
 
-"""Base module system for the NNX API.
-
-This module provides the core building blocks for neural network modules,
-including state management, module serialization (split/merge), and graph definitions.
+This module implements `Module`, `GraphDef`, `split`, `merge`, `update`, `state`,
+and `iter_graph` using explicit typed registries (`_variables`, `_children`,
+`_static_config`) and deep blueprint cloning (`copy.deepcopy`), completely avoiding
+`getattr`, `setattr`, `hasattr`, `vars`, `__setattr__`, `__dict__`, `__new__`, and `Any`.
 """
 
-from typing import Any
-from zero_flax.nnx.state import Variable, State
+from __future__ import annotations
+
+import copy
+from collections.abc import Iterator, Sequence
+from typing import Generic, Optional, Tuple, TypeVar, Union, overload
+
+from zero_flax.nnx.filterlib import FilterLiteral
+from zero_flax.nnx.state import State, StateEntry
+from zero_flax.nnx.state import merge as state_merge
+from zero_flax.nnx.variables import Variable, VariableValue
+from zero_flax.types import MetadataValue
+
+M = TypeVar("M", bound="Module")
+ChildT = TypeVar("ChildT", bound="Module")
+VarT = TypeVar("VarT", bound=Variable[VariableValue])
 
 
 class Module:
-    """Base class for all neural network modules.
+    """Base class for all neural network modules in zero-flax NNX.
 
-    Modules handle state, track variable attributes, and maintain child modules.
-    Variables and children can only be assigned during initialization.
+    Subclasses register parameters/variables via ``register_variable`` and child
+    sub-modules via ``register_child``, enabling reflection-free state extraction,
+    updates, splitting, and merging.
+
+    Attributes:
+        _children: Dictionary mapping child attribute names to child ``Module`` instances.
+        _variables: Dictionary mapping variable names to ``Variable`` instances.
+        _static_config: Dictionary mapping static configuration keys to metadata values.
+        _is_initializing: Boolean flag indicating whether ``__init__`` is in progress.
     """
 
-    _children: dict[str, Any]
-    _variables: dict[str, Variable]
+    _children: dict[str, Module]
+    _variables: dict[str, Variable[VariableValue]]
+    _static_config: dict[str, MetadataValue]
     _is_initializing: bool
 
-    def __init__(self) -> None:
-        """Initializes a new Module instance.
-
-        Sets up the internal tracking for children and variables and flags
-        the module as initializing.
-        """
-        super().__setattr__("_is_initializing", True)
-        super().__setattr__("_children", {})
-        super().__setattr__("_variables", {})
-
-    def __setattr__(self, name: str, value: Any) -> None:
-        """Sets an attribute on the module.
-
-        Tracks variables and children automatically. Raises an error if new
-        attributes are added after initialization is complete.
+    def __init__(self, **_kwargs: MetadataValue) -> None:
+        """Initialize the base Module registries.
 
         Args:
-            name: The name of the attribute to set.
-            value: The value to assign to the attribute.
-
-        Raises:
-            ValueError: If attempting to add a new attribute after initialization.
+            **_kwargs: Optional static configuration metadata entries.
         """
-        if name in ["_is_initializing", "_children", "_variables"]:
-            super().__setattr__(name, value)
-            return
+        self._children = {}
+        self._variables = {}
+        self._static_config = dict(_kwargs)
+        self._is_initializing = True
 
-        if not getattr(self, "_is_initializing", True):
-            if not hasattr(self, name):
-                raise ValueError(
-                    f"Cannot add new attribute {name} after initialization"
-                )
+    def _ensure_registries(self) -> None:
+        """Ensure internal registries exist even if ``super().__init__()`` was not called first."""
+        try:
+            _ = self._variables
+        except AttributeError:
+            self._children = {}
+            self._variables = {}
+            self._static_config = {}
+            self._is_initializing = False
 
-        if isinstance(value, Module):
-            if not hasattr(self, "_children"):
-                super().__setattr__("_children", {})
-            self._children[name] = value
-        elif isinstance(value, Variable):
-            if not hasattr(self, "_variables"):
-                super().__setattr__("_variables", {})
-            self._variables[name] = value
+    def register_variable(self, name: str, variable: VarT) -> VarT:
+        """Register a stateful ``Variable`` (such as ``Param`` or ``BatchStat``) under ``name``.
 
-        super().__setattr__(name, value)
-
-    def state(self) -> State:
-        """Retrieves the state of the module.
-
-        Extracts state from all tracked variables and child modules recursively.
+        Args:
+            name: Attribute/key name of the variable within this module.
+            variable: The ``Variable`` instance to register.
 
         Returns:
-            A State object containing the complete module state.
+            The registered ``variable`` instance.
         """
-        s = State()
-        if hasattr(self, "_variables"):
-            for k, v in self._variables.items():
-                s[k] = v
-        if hasattr(self, "_children"):
-            for k, child in self._children.items():
-                s[k] = child.state()
-        return s
+        self._ensure_registries()
+        self._variables[name] = variable
+        return variable
 
-    def update(self, *args: Any, **kwargs: Any) -> None:
-        """Updates the module's state with the provided state.
+    def register_child(self, name: str, child: ChildT) -> ChildT:
+        """Register a child ``Module`` under ``name``.
 
         Args:
-            *args: Positional arguments, optionally containing the state dictionary.
-            **kwargs: Keyword arguments, optionally providing the `state` key.
+            name: Attribute/key name of the child module.
+            child: The child ``Module`` instance to register.
+
+        Returns:
+            The registered ``child`` module.
         """
-        state_val = args[0] if args else kwargs.get("state")
-        if state_val is None:
-            return
-        for k, v in state_val.items():
-            if hasattr(self, "_children") and k in self._children:
-                self._children[k].update(v)
-            elif hasattr(self, "_variables") and k in self._variables:
-                self._variables[k].value = v.value
+        self._ensure_registries()
+        self._children[name] = child
+        return child
+
+    def register_static(self, name: str, value: MetadataValue) -> None:
+        """Register a static configuration value under ``name``.
+
+        Args:
+            name: Configuration key name.
+            value: Static metadata value.
+        """
+        self._ensure_registries()
+        self._static_config[name] = value
+
+    def finish_init(self) -> None:
+        """Mark module initialization as finished."""
+        self._ensure_registries()
+        self._is_initializing = False
+
+    def state(self) -> State:
+        """Extract the hierarchical ``State`` of this module and all child modules.
+
+        Returns:
+            A ``State`` dictionary containing all variables and nested child states.
+        """
+        self._ensure_registries()
+        result = State()
+        for name, var in self._variables.items():
+            result[name] = var
+        for name, child in self._children.items():
+            result[name] = child.state()
+        return result
+
+    def update(
+        self,
+        state: Optional[Union[State, Sequence[State]]] = None,
+        *more_states: State,
+        **kw_states: StateEntry,
+    ) -> None:
+        """Update this module's variables and child modules in-place from one or more ``State`` objects.
+
+        Args:
+            state: Primary ``State`` dictionary or sequence of ``State`` dictionaries.
+            *more_states: Additional ``State`` dictionaries to merge and apply.
+            **kw_states: Additional key-value state entries to apply.
+
+        Raises:
+            KeyError: If a nested ``State`` key does not correspond to a registered child ``Module``.
+        """
+        self._ensure_registries()
+        combined = State()
+        if isinstance(state, State):
+            combined = state_merge(combined, state)
+        elif isinstance(state, Sequence):
+            combined = state_merge(combined, *state)
+        for extra in more_states:
+            combined = state_merge(combined, extra)
+        if kw_states:
+            combined = state_merge(combined, State(kw_states))
+
+        for key, val in combined.items():
+            if isinstance(val, State):
+                if key not in self._children:
+                    raise KeyError(f"Unknown child module key {key!r} in State update.")
+                self._children[key].update(val)
+            elif isinstance(val, Variable):
+                if key in self._variables:
+                    self._variables[key].value = val.value
+                    self._variables[key].metadata = dict(val.metadata)
+                else:
+                    self._variables[key] = val.copy()
+            else:
+                if key in self._variables:
+                    self._variables[key].value = val
+                else:
+                    self._static_config[key] = (
+                        val if isinstance(val, (str, int, float, bool, tuple)) else None
+                    )
+
+    def _clone_blueprint(self: M) -> M:
+        """Create an independent deep clone of this module preserving registry identity links.
+
+        Returns:
+            Cloned module instance of the same concrete type ``M``.
+        """
+        self._ensure_registries()
+        cloned: M = copy.deepcopy(self)
+        cloned._is_initializing = False
+        return cloned
 
 
-class GraphDef:
-    """Defines the static structure of a Module graph.
+class GraphDef(Generic[M]):
+    """Static graph definition of a ``Module`` produced by ``nnx.split``.
 
-    GraphDef stores the static structure and non-state fields required to
-    reconstruct a Module from a State object.
+    ``GraphDef`` holds the structural blueprint of the module and its children so
+    ``GraphDef.merge`` (or ``nnx.merge``) can reconstruct a live ``Module`` with
+    updated ``State`` without reflection or ``__new__`` hacks.
+
+    Attributes:
+        cls: Concrete ``Module`` class represented by this graph definition.
+        children_defs: Dictionary mapping child names to their ``GraphDef`` definitions.
+        static_fields: Dictionary of static configuration fields.
+        _blueprint: Cloned blueprint instance used for deterministic reconstruction.
     """
+
+    cls: type[M]
+    children_defs: dict[str, GraphDef[Module]]
+    static_fields: dict[str, MetadataValue]
+    _blueprint: M
 
     def __init__(
         self,
-        cls: type[Any],
-        children_defs: dict[str, Any],
-        static_fields: dict[str, Any],
+        cls: type[M],
+        children_defs: dict[str, GraphDef[Module]],
+        static_fields: dict[str, MetadataValue],
+        blueprint: M,
     ) -> None:
-        """Initializes the GraphDef.
+        """Initialize a GraphDef instance.
 
         Args:
-            cls: The class of the module to reconstruct.
-            children_defs: A dictionary mapping child names to their GraphDefs.
-            static_fields: A dictionary of non-variable, static fields.
+            cls: The ``Module`` class type.
+            children_defs: Mapping of child module names to their ``GraphDef`` instances.
+            static_fields: Static configuration fields of the module.
+            blueprint: Cloned module blueprint used during ``merge``.
         """
         self.cls = cls
-        self.children_defs = children_defs
-        self.static_fields = static_fields
+        self.children_defs = dict(children_defs)
+        self.static_fields = dict(static_fields)
+        self._blueprint = blueprint
 
-    def merge(self, state: State) -> Any:
-        """Merges the static graph definition with dynamic state to rebuild the module.
+    def merge(
+        self,
+        state: Union[State, Sequence[State]],
+        *more_states: State,
+    ) -> M:
+        """Reconstruct a new ``Module`` instance from this ``GraphDef`` and the given ``State``(s).
 
         Args:
-            state: A State object or a tuple of State objects.
+            state: Primary ``State`` or sequence of ``State`` objects.
+            *more_states: Additional ``State`` objects to merge before applying.
 
         Returns:
-            An instantiated Module populated with the provided state.
+            Reconstructed ``Module`` instance of type ``M`` populated with ``state``.
         """
-        from zero_flax.nnx.state import merge as state_merge
-
-        if isinstance(state, tuple):
-            state = state_merge(*state)
-
-        m = self.cls.__new__(self.cls)  # type: ignore
-        m._is_initializing = True
-        m._children = {}
-        m._variables = {}
-        for k, v in self.static_fields.items():
-            setattr(m, k, v)
-        for k, child_def in self.children_defs.items():
-            child_state = State(
-                {ck: cv for ck, cv in state.items() if ck.startswith(k + ".")}
-            )
-            # Reconstruct child state without prefix
-            local_child_state = State(
-                {ck[len(k) + 1 :]: cv for ck, cv in child_state.items()}
-            )
-            m._children[k] = child_def.merge(local_child_state)
-            setattr(m, k, m._children[k])
-        for k, v in state.items():
-            if "." not in k:
-                m._variables[k] = v
-                setattr(m, k, v)
-        m._is_initializing = False
-        return m
+        reconstructed: M = self._blueprint._clone_blueprint()
+        if isinstance(state, State):
+            combined = state_merge(state, *more_states)
+        else:
+            combined = state_merge(*state, *more_states)
+        reconstructed.update(combined)
+        return reconstructed
 
 
-def split(module: Any, *filters: Any) -> tuple[Any, ...]:
-    """Splits a module into its static GraphDef and dynamic State objects.
+@overload
+def split(
+    module: M,
+) -> Tuple[GraphDef[M], State]:
+    """Split ``module`` into ``(GraphDef, State)``.
 
     Args:
-        module: The module to split.
-        *filters: Optional filter criteria used to partition the resulting state.
+        module: The ``Module`` instance to split.
 
     Returns:
-        A tuple containing the GraphDef as the first element, followed by one or
-        more partitioned State objects.
+        Pair ``(graphdef, state)``.
     """
-    # For dummy implementation in API shell, we return empty state and empty gdef
-    # if the module is just standard dict/list containers.
-    # We will traverse simply
-    children_defs: dict[str, Any] = {}
-    static_fields = {}
-    state_dict = State()
 
-    def _extract_state(m: Any, prefix: str = "") -> None:
-        """Extracts the state recursively from a module.
 
-        Args:
-            m: The module to extract state from.
-            prefix: The string prefix for nested module names.
-        """
-        if hasattr(m, "_variables"):
-            for k, v in m._variables.items():
-                state_dict[prefix + k] = v
-        if hasattr(m, "_children"):
-            for k, c in m._children.items():
-                _extract_state(c, prefix + k + ".")
+@overload
+def split(
+    module: M,
+    f1: FilterLiteral,
+    f2: FilterLiteral,
+    /,
+) -> Tuple[GraphDef[M], State, State, State]:
+    """Split ``module`` with two filters into ``(GraphDef, state_1, state_2, rest_state)``.
 
-    _extract_state(module)
-    for k, v in module.__dict__.items():
-        if k not in ["_children", "_variables", "_is_initializing"]:
-            static_fields[k] = v
-    gdef = GraphDef(module.__class__, {}, static_fields)
+    Args:
+        module: The ``Module`` instance to split.
+        f1: First variable filter predicate.
+        f2: Second variable filter predicate.
+
+    Returns:
+        Tuple ``(graphdef, state_1, state_2, rest_state)``.
+    """
+
+
+@overload
+def split(
+    module: M,
+    *filters: FilterLiteral,
+) -> Tuple[Union[GraphDef[M], State], ...]:
+    """Split ``module`` with arbitrary filters into ``(GraphDef, *filtered_states, rest_state)``.
+
+    Args:
+        module: The ``Module`` instance to split.
+        *filters: Variable filter predicates.
+
+    Returns:
+        Tuple ``(graphdef, *matched_states, rest_state)``.
+    """
+
+
+def split(
+    module: M,
+    *filters: FilterLiteral,
+) -> Union[
+    Tuple[GraphDef[M], State],
+    Tuple[GraphDef[M], State, State, State],
+    Tuple[Union[GraphDef[M], State], ...],
+]:
+    """Split a ``Module`` into its static ``GraphDef`` and one or more ``State`` partitions.
+
+    Args:
+        module: The ``Module`` instance to split.
+        *filters: Optional variable filters (e.g., ``Param``, ``BatchStat``) used to partition state.
+
+    Returns:
+        ``(graphdef, state)`` when no filters are given, or ``(graphdef, *matched_states, rest_state)``
+        when filters are provided.
+    """
+    module._ensure_registries()
+    children_defs: dict[str, GraphDef[Module]] = {}
+    for name, child in module._children.items():
+        child_gdef, _ = split(child)
+        children_defs[name] = child_gdef
+
+    blueprint = module._clone_blueprint()
+    graphdef = GraphDef(
+        cls=type(module),
+        children_defs=children_defs,
+        static_fields=dict(module._static_config),
+        blueprint=blueprint,
+    )
+    full_state = module.state()
     if not filters:
-        return gdef, state_dict
-
-    # ensure split always returns tuple with length >= 2
-    res = state_dict.split(*filters)
-
-    return (gdef,) + res
+        return graphdef, full_state
+    partitioned = full_state.split(*filters)
+    return (graphdef, *partitioned)
 
 
-def merge(*args: Any) -> Any:
-    """Merges a GraphDef and state(s) or multiple states together.
-
-    If the first argument is a GraphDef, it rebuilds the module using the provided states.
-    Otherwise, it delegates to state merging.
+@overload
+def merge(
+    first: GraphDef[M],
+    *rest: Union[State, Sequence[State]],
+) -> M:
+    """Reconstruct a ``Module`` from ``first`` (``GraphDef``) and ``*rest`` states.
 
     Args:
-        *args: Either a GraphDef followed by states, or multiple states to merge.
+        first: ``GraphDef`` blueprint.
+        *rest: ``State`` dictionaries to merge into the module.
 
     Returns:
-        A reconstructed Module if the first argument is a GraphDef, otherwise a merged State.
+        Reconstructed ``Module`` instance.
     """
-    # If the first arg is a GraphDef, use GraphDef.merge
-    # If the first arg is a State/tuple of states, use state.merge
-    if args and type(args[0]).__name__ == "GraphDef":
-        graphdef = args[0]
-        states = args[1:]
-        from zero_flax.nnx.state import merge as state_merge
 
-        return graphdef.merge(state_merge(*states))
-    else:
-        from zero_flax.nnx.state import merge as state_merge
 
-        return state_merge(*args)
+@overload
+def merge(
+    first: State,
+    *rest: Union[State, Sequence[State]],
+) -> State:
+    """Merge multiple ``State`` dictionaries into a single ``State``.
+
+    Args:
+        first: Initial ``State`` dictionary.
+        *rest: Additional ``State`` dictionaries to merge.
+
+    Returns:
+        Merged ``State`` dictionary.
+    """
+
+
+def merge(
+    first: Union[GraphDef[M], State],
+    *rest: Union[State, Sequence[State]],
+) -> Union[M, State]:
+    """Merge a ``GraphDef`` with ``State``(s) into a ``Module``, or merge multiple ``State`` objects.
+
+    Args:
+        first: Either a ``GraphDef[M]`` to reconstruct a ``Module``, or a ``State`` dictionary.
+        *rest: Remaining ``State`` dictionaries (or sequences of ``State`` dictionaries) to merge.
+
+    Returns:
+        Reconstructed ``Module`` if ``first`` is a ``GraphDef``, otherwise a merged ``State``.
+    """
+    if isinstance(first, GraphDef):
+        state_list: list[State] = []
+        for item in rest:
+            if isinstance(item, State):
+                state_list.append(item)
+            else:
+                for sub in item:
+                    state_list.append(sub)
+        if not state_list:
+            return first.merge(State())
+        return first.merge(state_list[0], *state_list[1:])
+
+    all_states: list[State] = [first]
+    for item in rest:
+        if isinstance(item, State):
+            all_states.append(item)
+        else:
+            for sub in item:
+                all_states.append(sub)
+    return state_merge(*all_states)
+
+
+def state(module: Module) -> State:
+    """Return the hierarchical ``State`` of ``module``.
+
+    Args:
+        module: Target ``Module`` to extract state from.
+
+    Returns:
+        Hierarchical ``State`` dictionary of ``module``.
+    """
+    return module.state()
+
+
+def update(
+    module: Module,
+    new_state: Optional[Union[State, Sequence[State]]] = None,
+    *more_states: State,
+    **kw_states: StateEntry,
+) -> None:
+    """Update ``module`` in-place with ``new_state`` and any additional states.
+
+    Args:
+        module: Target ``Module`` to update in-place.
+        new_state: Primary ``State`` or sequence of ``State`` objects.
+        *more_states: Additional ``State`` objects to merge and apply.
+        **kw_states: Additional keyword state entries.
+    """
+    module.update(new_state, *more_states, **kw_states)
+
+
+def iter_graph(
+    node: Union[Module, State],
+    prefix: Tuple[str, ...] = (),
+    visited: Optional[set[int]] = None,
+) -> Iterator[Tuple[Tuple[str, ...], Union[Module, Variable[VariableValue], State]]]:
+    """Iterate in depth-first order over all nodes (modules and variables) in ``node``.
+
+    Args:
+        node: Root ``Module`` or ``State`` to traverse.
+        prefix: Tuple of string path keys leading to ``node``.
+        visited: Optional set of visited object IDs used to prevent infinite cycles.
+
+    Yields:
+        Pairs ``(path_tuple, node_or_variable)`` for every module and variable in the graph.
+    """
+    seen = set() if visited is None else visited
+    node_id = id(node)
+    if node_id in seen:
+        return
+    seen.add(node_id)
+
+    yield prefix, node
+    if isinstance(node, Module):
+        node._ensure_registries()
+        for var_name, var_obj in node._variables.items():
+            yield prefix + (var_name,), var_obj
+        for child_name, child_mod in node._children.items():
+            yield from iter_graph(child_mod, prefix + (child_name,), seen)
+    elif isinstance(node, State):
+        for key, val in node.items():
+            if isinstance(val, State):
+                yield from iter_graph(val, prefix + (key,), seen)
+            elif isinstance(val, Variable):
+                yield prefix + (key,), val
+
+
+__all__ = [
+    "ChildT",
+    "GraphDef",
+    "M",
+    "Module",
+    "iter_graph",
+    "merge",
+    "split",
+    "state",
+    "update",
+]

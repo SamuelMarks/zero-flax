@@ -37,4 +37,4 @@ This document outlines the step-by-step checklist to replace the internal facade
 
 ## Phase 5: Verification & Compliance
 - [x] Run `pytest` and ensure all tests pass.
-- [x] Run `ml_framework_snapshots check flax src/zero_flax --reference-prefix flax --target-prefix zero_flax` to ensure `flax.nnx` API parity remains at 100% without relying on the purged facades.
+- [x] Run `ml_ecosystem_snapshots check flax_nnx src/zero_flax --reference-prefix flax --target-prefix zero_flax` to ensure `flax.nnx` API parity remains at 100% without relying on the purged facades.

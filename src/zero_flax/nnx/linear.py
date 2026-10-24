@@ -1,168 +1,821 @@
-from __future__ import annotations
+"""Linear, Dense, LinearGeneral, Einsum, LoRA, and LoRALinear layers for zero-flax NNX.
 
-"""Linear modules for neural networks.
-
-This module provides linear transformation layers including a standard linear
-(dense) layer, a general linear layer, and an einsum-based layer.
+This module implements standard and generalized linear transformations and Low-Rank
+Adaptation (LoRA) layers with exact parameter signatures matching `flax_nnx_v0.12.10`
+and full mathematical forward-pass execution.
 """
 
-from typing import Any, Callable, Sequence, Union, Tuple, Mapping, Optional
-from zero_flax.nnx.module import Module
-from zero_flax.nnx.state import Param
+from __future__ import annotations
+
+from collections.abc import Mapping, Sequence
+from types import MappingProxyType
+from typing import Optional, Tuple, Union
+
 from zero_jax import numpy as jnp
-from zero_jax.nn import initializers
+
+from zero_flax.nnx.module import Module
+from zero_flax.nnx.rnglib import Rngs, RngStream, resolve_rng_key
+from zero_flax.nnx.variables import LoRAParam, Param, Variable
+from zero_flax.types import (
+    EMPTY_METADATA,
+    ArrayLike,
+    DotGeneralLike,
+    DotGeneralProtocol,
+    DotGeneralT,
+    DType,
+    EinsumOpT,
+    InitializerLike,
+    JaxArray,
+    MetadataMapping,
+    MetadataValue,
+    PrecisionSpec,
+    PromoteDtypeFn,
+    Shape,
+    default_bias_init,
+    default_kernel_init,
+    default_promote_dtype,
+    ensure_array,
+    resolve_initializer,
+)
 
 
-class Einsum(Module):
-    """A module that performs a linear transformation using an einsum equation.
+def _normalize_einsum_equation(einsum_str: str) -> str:
+    """Normalize an Einstein summation equation, inferring output subscripts if omitted.
 
-    This is a generalized linear layer that allows specifying the contraction
-    operation using Einstein summation notation.
+    Args:
+        einsum_str: Raw Einstein summation string (e.g., ``"ab,bc->ac"`` or ``"ab,bc"``).
+
+    Returns:
+        Normalized equation string containing explicit ``"->"`` output subscripts.
     """
-
-    def __init__(
-        self,
-        einsum_str: str,
-        kernel_shape: Any,
-        bias_shape: Any = None,
-        dtype: Any = None,
-        param_dtype: Any = "jnp.float32",
-        precision: Any = None,
-        kernel_init: Any = "default_kernel_init",
-        bias_init: Any = "default_bias_init",
-        rngs: Any = None,
-    ) -> None:
-        """Initializes the Einsum module.
-
-        Args:
-            einsum_str: A string specifying the einsum equation.
-            kernel_shape: A tuple representing the shape of the kernel tensor.
-            bias_shape: An optional tuple representing the shape of the bias tensor.
-        """
-        super().__init__()
-        self.kernel_shape = kernel_shape
-        self._is_initializing = False
-
-    def __call__(self, x: Any, *args: Any, **kwargs: Any) -> Any:
-        """Applies the einsum transformation to the input.
-
-        Args:
-            x: The input tensor.
-
-        Returns:
-            The transformed output tensor.
-        """
-        return jnp.zeros(jnp.shape(x)[:-1] + (self.kernel_shape[-1],))
+    cleaned = einsum_str.replace(" ", "")
+    if "->" in cleaned:
+        return cleaned
+    counts: dict[str, int] = {}
+    for ch in cleaned:
+        if ch.isalpha():
+            counts[ch] = counts.get(ch, 0) + 1
+    out_chars = "".join(sorted(ch for ch, cnt in counts.items() if cnt == 1))
+    return f"{cleaned}->{out_chars}"
 
 
 class Linear(Module):
-    """A standard linear (dense) transformation layer.
+    """Standard dense linear transformation layer ($y = x W + b$).
 
-    Applies a linear transformation to the incoming data: `y = xA^T + b`.
+    Attributes:
+        in_features: Number of input features.
+        out_features: Number of output features.
+        use_bias: Whether a learnable bias vector is added.
+        dtype: Computation data type.
+        param_dtype: Parameter initialization data type.
+        precision: Numerical precision specification.
+        kernel_init: Initializer for the weight matrix.
+        bias_init: Initializer for the bias vector.
+        dot_general: Generalized dot product function.
+        promote_dtype: Dtype promotion callable.
+        preferred_element_type: Optional preferred accumulation dtype.
+        kernel: Learnable weight matrix ``Param`` of shape ``(in_features, out_features)``.
+        bias: Optional learnable bias vector ``Param`` of shape ``(out_features,)``.
     """
+
+    in_features: int
+    out_features: int
+    use_bias: bool
+    dtype: Optional[DType]
+    param_dtype: DType
+    precision: PrecisionSpec
+    kernel_init: InitializerLike
+    bias_init: InitializerLike
+    dot_general: DotGeneralLike
+    promote_dtype: PromoteDtypeFn
+    preferred_element_type: Optional[DType]
+    kernel: Param[JaxArray]
+    bias: Optional[Param[JaxArray]]
 
     def __init__(
         self,
         in_features: int,
         out_features: int,
+        *,
         use_bias: bool = True,
-        dtype: Any = None,
-        param_dtype: Any = None,
-        precision: Any = None,
-        kernel_init: Optional[Callable[..., Any]] = None,
-        bias_init: Optional[Callable[..., Any]] = None,
-        dot_general: Any = None,
-        rngs: Any = None,
+        dtype: Optional[DType] = None,
+        param_dtype: DType = "float32",
+        precision: PrecisionSpec = None,
+        kernel_init: InitializerLike = default_kernel_init,
+        bias_init: InitializerLike = default_bias_init,
+        dot_general: DotGeneralLike = None,
+        promote_dtype: PromoteDtypeFn = default_promote_dtype,
+        preferred_element_type: Optional[DType] = None,
+        rngs: Optional[Union[Rngs, RngStream]] = None,
+        kernel_metadata: MetadataMapping = EMPTY_METADATA,
+        bias_metadata: MetadataMapping = EMPTY_METADATA,
     ) -> None:
-        """Initializes the Linear layer.
+        """Initialize a Linear layer.
 
         Args:
-            in_features: The number of input features.
-            out_features: The number of output features.
-            use_bias: Whether to add a bias term to the output. Defaults to True.
-            dtype: The data type of the computation.
-            param_dtype: The data type of the parameters.
-            precision: The precision of the computation.
-            kernel_init: The initializer function for the weight matrix. Defaults to
-                glorot_uniform.
-            bias_init: The initializer function for the bias vector. Defaults to zeros.
-            dot_general: An optional custom dot_general function.
-            rngs: A dictionary of PRNG key sequences.
+            in_features: Size of the last dimension of the input tensor.
+            out_features: Size of the last dimension of the output tensor.
+            use_bias: Whether to add a learnable bias vector. Defaults to ``True``.
+            dtype: Data type of the computation.
+            param_dtype: Data type of the initialized parameters.
+            precision: Numerical precision for the matrix multiplication.
+            kernel_init: Initializer function for the weight matrix.
+            bias_init: Initializer function for the bias vector.
+            dot_general: Generalized contraction function.
+            promote_dtype: Function used to promote input and parameter dtypes.
+            preferred_element_type: Optional accumulation data type.
+            rngs: Random number generator stream(s) for parameter initialization.
+            kernel_metadata: Optional metadata mapping attached to ``kernel``.
+            bias_metadata: Optional metadata mapping attached to ``bias``.
         """
         super().__init__()
-        kernel_init = kernel_init or initializers.glorot_uniform()
-        bias_init = bias_init or initializers.zeros
-        import zero_jax as jax
+        self.in_features = int(in_features)
+        self.out_features = int(out_features)
+        self.use_bias = bool(use_bias)
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+        self.precision = precision
+        self.kernel_init = kernel_init
+        self.bias_init = bias_init
+        self.dot_general = dot_general
+        self.promote_dtype = promote_dtype
+        self.preferred_element_type = preferred_element_type
 
-        key = jax.random.PRNGKey(0)
-        self.kernel = Param(kernel_init(key, (in_features, out_features)))
-        self.use_bias = use_bias
-        if use_bias:
-            self.bias = Param(bias_init(key, (out_features,)))
-        self._is_initializing = False
+        k_fn = resolve_initializer(kernel_init, default_kernel_init)
+        k_key = resolve_rng_key(rngs, "params", fold_index=0)
+        k_meta = dict(kernel_metadata) if kernel_metadata is not None else {}
+        self.kernel = self.register_variable(
+            "kernel",
+            Param(k_fn(k_key, (self.in_features, self.out_features), param_dtype), **k_meta),
+        )
 
-    def __call__(self, inputs: Any) -> Any:
-        """Applies the linear transformation to the inputs.
+        if self.use_bias:
+            b_fn = resolve_initializer(bias_init, default_bias_init)
+            b_key = resolve_rng_key(rngs, "params", fold_index=1)
+            b_meta = dict(bias_metadata) if bias_metadata is not None else {}
+            self.bias = self.register_variable(
+                "bias",
+                Param(b_fn(b_key, (self.out_features,), param_dtype), **b_meta),
+            )
+        else:
+            self.bias = None
+        self.finish_init()
+
+    def __call__(self, inputs: ArrayLike) -> JaxArray:
+        """Apply the linear transformation $y = x W + b$ to ``inputs``.
 
         Args:
-            inputs: The input tensor of shape `(..., in_features)`.
+            inputs: Input tensor whose last dimension has size ``in_features``.
 
         Returns:
-            The transformed tensor of shape `(..., out_features)`.
+            Transformed output ``JaxArray`` with last dimension ``out_features``.
+
+        Raises:
+            ValueError: If the last dimension of ``inputs`` does not match ``self.in_features``.
         """
-        # Use jnp.tensordot for arbitrary axes contraction
-        y = jnp.tensordot(inputs, self.kernel.value, axes=([-1], [0]))
-        if self.use_bias:
-            y = jnp.add(y, self.bias.value)
-        return y
+        x = ensure_array(inputs)
+        if x.ndim == 0 or x.shape[-1] != self.in_features:
+            raise ValueError(
+                f"Linear input last dimension ({x.shape[-1] if x.ndim > 0 else 'scalar'}) "
+                f"does not match in_features ({self.in_features})."
+            )
+        k = ensure_array(self.kernel.value)
+        if self.promote_dtype is not None:
+            promoted = self.promote_dtype(x, k, dtype=self.dtype)
+            x, k = promoted[0], promoted[1]
+        if self.dot_general is not None:
+            last_axis = x.ndim - 1
+            out: JaxArray = self.dot_general(
+                x,
+                k,
+                (((last_axis,), (0,)), ((), ())),
+                precision=self.precision,
+                preferred_element_type=self.preferred_element_type,
+            )
+        else:
+            out = jnp.dot(x, k)
+        if self.use_bias and self.bias is not None:
+            out = out + ensure_array(self.bias.value, dtype=self.dtype)
+        if self.preferred_element_type is not None:
+            out = ensure_array(out, dtype=self.preferred_element_type)
+        return out
+
+
+class Dense(Linear):
+    """Dense linear layer alias inheriting full functionality from ``Linear``.
+
+    Attributes:
+        features: Number of output features (alias for ``out_features``).
+    """
+
+    features: int
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        *,
+        use_bias: bool = True,
+        dtype: Optional[DType] = None,
+        param_dtype: DType = "float32",
+        precision: PrecisionSpec = None,
+        kernel_init: InitializerLike = default_kernel_init,
+        bias_init: InitializerLike = default_bias_init,
+        dot_general: DotGeneralLike = None,
+        promote_dtype: PromoteDtypeFn = default_promote_dtype,
+        preferred_element_type: Optional[DType] = None,
+        rngs: Optional[Union[Rngs, RngStream]] = None,
+        kernel_metadata: MetadataMapping = EMPTY_METADATA,
+        bias_metadata: MetadataMapping = EMPTY_METADATA,
+    ) -> None:
+        """Initialize a Dense layer.
+
+        Args:
+            in_features: Number of input features.
+            out_features: Number of output features.
+            use_bias: Whether to include a learnable bias vector.
+            dtype: Computation data type.
+            param_dtype: Parameter initialization data type.
+            precision: Numerical precision specification.
+            kernel_init: Weight matrix initializer.
+            bias_init: Bias vector initializer.
+            dot_general: Generalized dot product callable.
+            promote_dtype: Dtype promotion callable.
+            preferred_element_type: Optional accumulation dtype.
+            rngs: Random number generator streams.
+            kernel_metadata: Metadata attached to ``kernel``.
+            bias_metadata: Metadata attached to ``bias``.
+        """
+        super().__init__(
+            in_features=in_features,
+            out_features=out_features,
+            use_bias=use_bias,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            kernel_init=kernel_init,
+            bias_init=bias_init,
+            dot_general=dot_general,
+            promote_dtype=promote_dtype,
+            preferred_element_type=preferred_element_type,
+            rngs=rngs,
+            kernel_metadata=kernel_metadata,
+            bias_metadata=bias_metadata,
+        )
+        self.features = self.out_features
 
 
 class LinearGeneral(Module):
-    """A general linear transformation layer.
+    """Generalized linear transformation over arbitrary input, batch, and output feature axes.
 
-    Similar to `Linear`, but allows `in_features` and `out_features` to be
-    sequences, effectively reshaping the dimensions during the transformation.
+    Attributes:
+        in_features: Tuple of input feature dimension sizes.
+        out_features: Tuple of output feature dimension sizes.
+        axis: Tuple of input axes to contract.
+        batch_axis: Mapping of input batch axes to kernel batch axes.
+        use_bias: Whether to add a learnable bias tensor.
+        dtype: Computation data type.
+        param_dtype: Parameter data type.
+        kernel: Learnable weight tensor ``Param`` of shape ``(*batch_dims, *in_features, *out_features)``.
+        bias: Optional learnable bias tensor ``Param`` of shape ``(*batch_dims, *out_features)``.
     """
+
+    in_features: Tuple[int, ...]
+    out_features: Tuple[int, ...]
+    axis: Tuple[int, ...]
+    batch_axis: dict[int, int]
+    use_bias: bool
+    dtype: Optional[DType]
+    param_dtype: DType
+    precision: PrecisionSpec
+    promote_dtype: PromoteDtypeFn
+    dot_general: DotGeneralLike
+    dot_general_cls: Optional[type[DotGeneralT]]
+    preferred_element_type: Optional[DType]
+    kernel: Param[JaxArray]
+    bias: Optional[Param[JaxArray]]
 
     def __init__(
         self,
         in_features: Union[int, Sequence[int]],
         out_features: Union[int, Sequence[int]],
-        axis: Any = -1,
-        batch_axis: Any = "FrozenDict({})",
+        *,
+        axis: Union[int, Sequence[int]] = -1,
+        batch_axis: Union[Mapping[int, int], Sequence[int], None] = MappingProxyType({}),
         use_bias: bool = True,
-        dtype: Any = None,
-        param_dtype: Any = "jnp.float32",
-        kernel_init: Any = "default_kernel_init",
-        bias_init: Any = "default_bias_init",
-        precision: Any = None,
-        dot_general: Any = None,
-        dot_general_cls: Any = None,
-        rngs: Any = None,
+        dtype: Optional[DType] = None,
+        param_dtype: DType = "float32",
+        kernel_init: InitializerLike = default_kernel_init,
+        bias_init: InitializerLike = default_bias_init,
+        precision: PrecisionSpec = None,
+        promote_dtype: PromoteDtypeFn = default_promote_dtype,
+        dot_general: DotGeneralLike = None,
+        dot_general_cls: Optional[type[DotGeneralT]] = None,
+        preferred_element_type: Optional[DType] = None,
+        rngs: Optional[Union[Rngs, RngStream]] = None,
+        kernel_metadata: MetadataMapping = EMPTY_METADATA,
+        bias_metadata: MetadataMapping = EMPTY_METADATA,
     ) -> None:
-        """Initializes the LinearGeneral layer.
+        """Initialize a LinearGeneral layer.
 
         Args:
-            in_features: The number of input features or a sequence of dimensions.
-            out_features: The number of output features or a sequence of dimensions.
+            in_features: Input feature dimension size or sequence of sizes.
+            out_features: Output feature dimension size or sequence of sizes.
+            axis: Input axis or sequence of axes along which to contract.
+            batch_axis: Optional mapping or sequence of batch dimension indices.
+            use_bias: Whether to include a learnable bias tensor.
+            dtype: Computation data type.
+            param_dtype: Parameter initialization data type.
+            kernel_init: Initializer for the weight tensor.
+            bias_init: Initializer for the bias tensor.
+            precision: Numerical precision specification.
+            promote_dtype: Dtype promotion callable.
+            dot_general: Optional generalized contraction callable.
+            dot_general_cls: Optional class factory for ``dot_general``.
+            preferred_element_type: Optional accumulation dtype.
+            rngs: Random number generator stream(s).
+            kernel_metadata: Metadata attached to ``kernel``.
+            bias_metadata: Metadata attached to ``bias``.
         """
         super().__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        self._is_initializing = False
+        self.in_features = (
+            (int(in_features),)
+            if isinstance(in_features, int)
+            else tuple(int(f) for f in in_features)
+        )
+        self.out_features = (
+            (int(out_features),)
+            if isinstance(out_features, int)
+            else tuple(int(f) for f in out_features)
+        )
+        self.axis = (int(axis),) if isinstance(axis, int) else tuple(int(a) for a in axis)
+        if batch_axis is None:
+            self.batch_axis = {}
+        elif isinstance(batch_axis, Mapping):
+            self.batch_axis = {int(k): int(v) for k, v in batch_axis.items()}
+        else:
+            self.batch_axis = {int(ax): idx for idx, ax in enumerate(batch_axis)}
+        self.use_bias = bool(use_bias)
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+        self.precision = precision
+        self.promote_dtype = promote_dtype
+        self.dot_general = dot_general
+        self.dot_general_cls = dot_general_cls
+        self.preferred_element_type = preferred_element_type
 
-    def __call__(self, inputs: Any) -> Any:
-        """Applies the general linear transformation to the inputs.
+        k_fn = resolve_initializer(kernel_init, default_kernel_init)
+        k_key = resolve_rng_key(rngs, "params", fold_index=0)
+        k_meta = dict(kernel_metadata) if kernel_metadata is not None else {}
+        kernel_shape = self.in_features + self.out_features
+        self.kernel = self.register_variable(
+            "kernel",
+            Param(k_fn(k_key, kernel_shape, param_dtype), **k_meta),
+        )
+
+        if self.use_bias:
+            b_fn = resolve_initializer(bias_init, default_bias_init)
+            b_key = resolve_rng_key(rngs, "params", fold_index=1)
+            b_meta = dict(bias_metadata) if bias_metadata is not None else {}
+            self.bias = self.register_variable(
+                "bias",
+                Param(b_fn(b_key, self.out_features, param_dtype), **b_meta),
+            )
+        else:
+            self.bias = None
+        self.finish_init()
+
+    def __call__(self, inputs: ArrayLike) -> JaxArray:
+        """Contract ``inputs`` along ``self.axis`` with ``self.kernel`` and add ``self.bias``.
 
         Args:
-            inputs: The input tensor.
+            inputs: Input array whose ``self.axis`` dimensions match ``self.in_features``.
 
         Returns:
-            The transformed tensor.
+            Contracted output ``JaxArray`` with trailing dimensions ``self.out_features``.
+
+        Raises:
+            ValueError: If contracted input dimensions do not match ``self.in_features``.
         """
-        _out = (
-            [self.out_features]
-            if isinstance(self.out_features, int)
-            else list(self.out_features)
+        x = ensure_array(inputs)
+        k = ensure_array(self.kernel.value)
+        if self.promote_dtype is not None:
+            promoted = self.promote_dtype(x, k, dtype=self.dtype)
+            x, k = promoted[0], promoted[1]
+        ndim = x.ndim
+        norm_axes = tuple(a if a >= 0 else ndim + a for a in self.axis)
+        lhs_batch_axes = tuple(a if a >= 0 else ndim + a for a in self.batch_axis)
+        rhs_batch_axes = tuple(b if b >= 0 else k.ndim + b for b in self.batch_axis.values())
+        kernel_contract_axes = tuple(
+            i for i in range(len(rhs_batch_axes) + len(self.in_features)) if i not in rhs_batch_axes
         )
-        return jnp.zeros(jnp.shape(inputs)[:-1] + tuple(_out))
+        for ax, expected_dim in zip(norm_axes, self.in_features):
+            if ax < 0 or ax >= ndim or x.shape[ax] != expected_dim:
+                raise ValueError(
+                    f"LinearGeneral input dimension at axis {ax} ({x.shape[ax] if 0 <= ax < ndim else 'out of bounds'}) "
+                    f"does not match expected in_features {expected_dim}."
+                )
+
+        dg: Optional[Union[DotGeneralProtocol, DotGeneralT]] = None
+        if self.dot_general is not None:
+            dg = self.dot_general
+        elif self.dot_general_cls is not None:
+            dg = self.dot_general_cls()
+        elif len(lhs_batch_axes) > 0:
+            dg = DotGeneralT()
+
+        if dg is not None:
+            out: JaxArray = dg(
+                x,
+                k,
+                ((norm_axes, kernel_contract_axes), (lhs_batch_axes, rhs_batch_axes)),
+                precision=self.precision,
+                preferred_element_type=self.preferred_element_type,
+            )
+        else:
+            out = jnp.tensordot(x, k, axes=(norm_axes, kernel_contract_axes))
+
+        if self.use_bias and self.bias is not None:
+            b_arr = ensure_array(self.bias.value, dtype=self.dtype)
+            if b_arr.ndim < out.ndim:
+                bcast_shape = (1,) * (out.ndim - b_arr.ndim) + b_arr.shape
+                b_arr = jnp.reshape(b_arr, bcast_shape)
+            out = out + b_arr
+        if self.preferred_element_type is not None:
+            out = ensure_array(out, dtype=self.preferred_element_type)
+        return out
+
+
+class Einsum(Module):
+    """Learnable Einstein summation layer with parameterized kernel and optional bias.
+
+    Attributes:
+        einsum_str: Normalized Einstein summation subscript string.
+        kernel_shape: Tuple of kernel dimensions.
+        bias_shape: Optional tuple of bias dimensions.
+        kernel: Learnable weight ``Param``.
+        bias: Optional learnable bias ``Param``.
+    """
+
+    einsum_str: str
+    kernel_shape: Tuple[int, ...]
+    bias_shape: Optional[Tuple[int, ...]]
+    dtype: Optional[DType]
+    param_dtype: DType
+    precision: PrecisionSpec
+    promote_dtype: PromoteDtypeFn
+    einsum_op: EinsumOpT
+    preferred_element_type: Optional[DType]
+    kernel: Param[JaxArray]
+    bias: Optional[Param[JaxArray]]
+
+    def __init__(
+        self,
+        einsum_str: str,
+        kernel_shape: Union[Shape, Sequence[int]],
+        bias_shape: Optional[Union[Shape, Sequence[int]]] = None,
+        *,
+        dtype: Optional[DType] = None,
+        param_dtype: DType = "float32",
+        precision: PrecisionSpec = None,
+        kernel_init: InitializerLike = default_kernel_init,
+        bias_init: InitializerLike = default_bias_init,
+        promote_dtype: PromoteDtypeFn = default_promote_dtype,
+        einsum_op: EinsumOpT = None,
+        preferred_element_type: Optional[DType] = None,
+        rngs: Optional[Union[Rngs, RngStream]] = None,
+        kernel_metadata: MetadataMapping = EMPTY_METADATA,
+        bias_metadata: MetadataMapping = EMPTY_METADATA,
+    ) -> None:
+        """Initialize an Einsum layer.
+
+        Args:
+            einsum_str: Einstein summation equation string (e.g., ``"ab,bc->ac"`` or ``"ab,bc"``).
+            kernel_shape: Shape of the learnable weight tensor.
+            bias_shape: Optional shape of the learnable bias tensor.
+            dtype: Computation data type.
+            param_dtype: Parameter initialization data type.
+            precision: Numerical precision specification.
+            kernel_init: Weight tensor initializer.
+            bias_init: Bias tensor initializer.
+            promote_dtype: Dtype promotion callable.
+            einsum_op: Underlying einsum operator callable.
+            preferred_element_type: Optional accumulation dtype.
+            rngs: Random number generator stream(s).
+            kernel_metadata: Metadata attached to ``kernel``.
+            bias_metadata: Metadata attached to ``bias``.
+        """
+        super().__init__()
+        self.einsum_str = _normalize_einsum_equation(einsum_str)
+        self.kernel_shape = tuple(int(d) for d in kernel_shape)
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+        self.precision = precision
+        self.promote_dtype = promote_dtype
+        self.einsum_op = einsum_op
+        self.preferred_element_type = preferred_element_type
+
+        k_fn = resolve_initializer(kernel_init, default_kernel_init)
+        k_key = resolve_rng_key(rngs, "params", fold_index=0)
+        k_meta = dict(kernel_metadata) if kernel_metadata is not None else {}
+        self.kernel = self.register_variable(
+            "kernel",
+            Param(k_fn(k_key, self.kernel_shape, param_dtype), **k_meta),
+        )
+
+        if bias_shape is not None:
+            self.bias_shape = tuple(int(d) for d in bias_shape)
+            b_fn = resolve_initializer(bias_init, default_bias_init)
+            b_key = resolve_rng_key(rngs, "params", fold_index=1)
+            b_meta = dict(bias_metadata) if bias_metadata is not None else {}
+            self.bias = self.register_variable(
+                "bias",
+                Param(b_fn(b_key, self.bias_shape, param_dtype), **b_meta),
+            )
+        else:
+            self.bias_shape = None
+            self.bias = None
+        self.finish_init()
+
+    def __call__(self, inputs: ArrayLike) -> JaxArray:
+        """Evaluate the Einstein summation between ``inputs`` and ``self.kernel``.
+
+        Args:
+            inputs: Input array matching the first operand of ``self.einsum_str``.
+
+        Returns:
+            Resulting ``JaxArray`` (plus ``self.bias`` if configured).
+        """
+        x = ensure_array(inputs)
+        k = ensure_array(self.kernel.value)
+        if self.promote_dtype is not None:
+            promoted = self.promote_dtype(x, k, dtype=self.dtype)
+            x, k = promoted[0], promoted[1]
+        if self.einsum_op is not None:
+            out: JaxArray = self.einsum_op(self.einsum_str, x, k)
+        else:
+            out = jnp.einsum(self.einsum_str, x, k)
+        if self.bias is not None:
+            out = out + ensure_array(self.bias.value, dtype=self.dtype)
+        if self.preferred_element_type is not None:
+            out = ensure_array(out, dtype=self.preferred_element_type)
+        return out
+
+
+class LoRA(Module):
+    """Low-Rank Adaptation (LoRA) module computing $y = (x A) B$ (plus optional base module output).
+
+    Attributes:
+        in_features: Input feature dimension size.
+        lora_rank: Low-rank bottleneck dimension size.
+        out_features: Output feature dimension size.
+        base_module: Optional wrapped base ``Module`` whose output is added to the LoRA branch.
+        lora_a: Low-rank down-projection parameter of shape ``(in_features, lora_rank)``.
+        lora_b: Low-rank up-projection parameter of shape ``(lora_rank, out_features)``.
+    """
+
+    in_features: int
+    lora_rank: int
+    out_features: int
+    base_module: Optional[Module]
+    dtype: Optional[DType]
+    param_dtype: DType
+    precision: PrecisionSpec
+    lora_param_type: type[Variable[JaxArray]]
+    promote_dtype: PromoteDtypeFn
+    lora_a: Variable[JaxArray]
+    lora_b: Variable[JaxArray]
+
+    def __init__(
+        self,
+        in_features: int,
+        lora_rank: int,
+        out_features: int,
+        precision: PrecisionSpec = None,
+        *,
+        base_module: Optional[Module] = None,
+        dtype: Optional[DType] = None,
+        param_dtype: DType = "float32",
+        a_initializer: InitializerLike = default_kernel_init,
+        b_initializer: InitializerLike = default_bias_init,
+        lora_param_type: type[Variable[JaxArray]] = LoRAParam,
+        promote_dtype: PromoteDtypeFn = default_promote_dtype,
+        rngs: Optional[Union[Rngs, RngStream]] = None,
+        a_metadata: MetadataMapping = EMPTY_METADATA,
+        b_metadata: MetadataMapping = EMPTY_METADATA,
+    ) -> None:
+        """Initialize a LoRA layer.
+
+        Args:
+            in_features: Number of input features.
+            lora_rank: Low-rank bottleneck rank $r$.
+            out_features: Number of output features.
+            precision: Optional matrix multiplication precision.
+            base_module: Optional base ``Module`` evaluated in parallel with the LoRA adapter.
+            dtype: Computation data type.
+            param_dtype: Parameter initialization data type.
+            a_initializer: Initializer for down-projection matrix ``lora_a``.
+            b_initializer: Initializer for up-projection matrix ``lora_b``.
+            lora_param_type: Variable subclass used to wrap ``lora_a`` and ``lora_b``.
+            promote_dtype: Dtype promotion callable.
+            rngs: Random number generator stream(s).
+            a_metadata: Metadata attached to ``lora_a``.
+            b_metadata: Metadata attached to ``lora_b``.
+        """
+        super().__init__()
+        self.in_features = int(in_features)
+        self.lora_rank = int(lora_rank)
+        self.out_features = int(out_features)
+        self.precision = precision
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+        self.promote_dtype = promote_dtype
+
+        if isinstance(base_module, Module):
+            self.base_module = self.register_child("base_module", base_module)
+        else:
+            self.base_module = None
+
+        self.lora_param_type = lora_param_type
+
+        a_fn = resolve_initializer(a_initializer, default_kernel_init)
+        b_fn = resolve_initializer(b_initializer, default_bias_init)
+        a_key = resolve_rng_key(rngs, "params", fold_index=0)
+        b_key = resolve_rng_key(rngs, "params", fold_index=1)
+        a_meta = dict(a_metadata) if a_metadata is not None else {}
+        b_meta = dict(b_metadata) if b_metadata is not None else {}
+
+        self.lora_a = self.register_variable(
+            "lora_a",
+            lora_param_type(a_fn(a_key, (self.in_features, self.lora_rank), param_dtype), **a_meta),
+        )
+        self.lora_b = self.register_variable(
+            "lora_b",
+            lora_param_type(
+                b_fn(b_key, (self.lora_rank, self.out_features), param_dtype), **b_meta
+            ),
+        )
+        self.finish_init()
+
+    def __call__(self, x: ArrayLike) -> JaxArray:
+        """Apply the low-rank adaptation $(x A) B$ (and add ``base_module(x)`` if present).
+
+        Args:
+            x: Input array with last dimension ``in_features``.
+
+        Returns:
+            Output ``JaxArray`` with last dimension ``out_features``.
+        """
+        arr = ensure_array(x)
+        a_val = ensure_array(self.lora_a.value)
+        b_val = ensure_array(self.lora_b.value)
+        if self.promote_dtype is not None:
+            promoted = self.promote_dtype(arr, a_val, b_val, dtype=self.dtype)
+            arr, a_val, b_val = promoted[0], promoted[1], promoted[2]
+        hidden: JaxArray = jnp.dot(arr, a_val)
+        lora_out: JaxArray = jnp.dot(hidden, b_val)
+        if self.base_module is not None and callable(self.base_module):
+            base_out: JaxArray = ensure_array(self.base_module(arr))
+            return base_out + lora_out
+        return lora_out
+
+
+class LoRALinear(Linear):
+    """Linear layer combined with a built-in Low-Rank Adaptation (LoRA) branch.
+
+    Attributes:
+        base_module: Optional external base ``Module`` overriding the linear path.
+        lora: Child ``LoRA`` adapter module.
+    """
+
+    base_module: Optional[Module]
+    lora: LoRA
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        base_module: Optional[Module] = None,
+        dtype: Optional[DType] = None,
+        param_dtype: DType = "float32",
+        precision: PrecisionSpec = None,
+        *,
+        lora_rank: int = 4,
+        a_initializer: InitializerLike = default_kernel_init,
+        b_initializer: InitializerLike = default_bias_init,
+        lora_param_type: type[Variable[JaxArray]] = LoRAParam,
+        lora_promote_dtype: PromoteDtypeFn = default_promote_dtype,
+        a_metadata: MetadataMapping = EMPTY_METADATA,
+        b_metadata: MetadataMapping = EMPTY_METADATA,
+        rngs: Optional[Union[Rngs, RngStream]] = None,
+        lora_dtype: Optional[DType] = None,
+        lora_param_dtype: DType = "float32",
+        use_bias: bool = True,
+        kernel_init: InitializerLike = default_kernel_init,
+        bias_init: InitializerLike = default_bias_init,
+        dot_general: DotGeneralLike = None,
+        promote_dtype: PromoteDtypeFn = default_promote_dtype,
+        preferred_element_type: Optional[DType] = None,
+        kernel_metadata: MetadataMapping = EMPTY_METADATA,
+        bias_metadata: MetadataMapping = EMPTY_METADATA,
+        **kwargs: MetadataValue,
+    ) -> None:
+        """Initialize a LoRALinear layer.
+
+        Args:
+            in_features: Number of input features.
+            out_features: Number of output features.
+            base_module: Optional base module override.
+            dtype: Linear computation data type.
+            param_dtype: Linear parameter initialization data type.
+            precision: Numerical precision specification.
+            lora_rank: Rank of the LoRA adapter matrices. Defaults to ``4``.
+            a_initializer: Initializer for LoRA ``lora_a``.
+            b_initializer: Initializer for LoRA ``lora_b``.
+            lora_param_type: Variable subclass for LoRA parameters.
+            lora_promote_dtype: Dtype promotion callable for the LoRA branch.
+            a_metadata: Metadata mapping for ``lora_a``.
+            b_metadata: Metadata mapping for ``lora_b``.
+            rngs: Random number generator stream(s).
+            lora_dtype: Optional computation dtype for the LoRA branch.
+            lora_param_dtype: Parameter dtype for the LoRA branch.
+            use_bias: Whether the linear branch includes a bias vector.
+            kernel_init: Initializer for the linear weight matrix.
+            bias_init: Initializer for the linear bias vector.
+            dot_general: Generalized dot product callable.
+            promote_dtype: Dtype promotion callable for the linear branch.
+            preferred_element_type: Optional accumulation dtype.
+            kernel_metadata: Metadata mapping for ``kernel``.
+            bias_metadata: Metadata mapping for ``bias``.
+            **kwargs: Additional configuration metadata entries.
+        """
+        super().__init__(
+            in_features=in_features,
+            out_features=out_features,
+            use_bias=use_bias,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            kernel_init=kernel_init,
+            bias_init=bias_init,
+            dot_general=dot_general,
+            promote_dtype=promote_dtype,
+            preferred_element_type=preferred_element_type,
+            rngs=rngs,
+            kernel_metadata=kernel_metadata,
+            bias_metadata=bias_metadata,
+        )
+        for k_name, k_val in kwargs.items():
+            self.register_static(k_name, k_val)
+        if isinstance(base_module, Module):
+            self.base_module = self.register_child("base_module", base_module)
+        else:
+            self.base_module = None
+        self.lora = self.register_child(
+            "lora",
+            LoRA(
+                in_features=in_features,
+                lora_rank=lora_rank,
+                out_features=out_features,
+                precision=precision,
+                base_module=None,
+                dtype=lora_dtype if lora_dtype is not None else dtype,
+                param_dtype=lora_param_dtype,
+                a_initializer=a_initializer,
+                b_initializer=b_initializer,
+                lora_param_type=lora_param_type,
+                promote_dtype=lora_promote_dtype,
+                rngs=rngs,
+                a_metadata=a_metadata,
+                b_metadata=b_metadata,
+            ),
+        )
+        self.finish_init()
+
+    def __call__(self, inputs: ArrayLike) -> JaxArray:
+        """Compute the sum of the linear projection (or ``base_module``) and the LoRA branch.
+
+        Args:
+            inputs: Input tensor with last dimension ``in_features``.
+
+        Returns:
+            Output ``JaxArray`` with last dimension ``out_features``.
+        """
+        if self.base_module is not None and callable(self.base_module):
+            linear_out: JaxArray = ensure_array(self.base_module(inputs))
+        else:
+            linear_out = super().__call__(inputs)
+        lora_out = self.lora(inputs)
+        return linear_out + lora_out
+
+
+__all__ = [
+    "Dense",
+    "Einsum",
+    "Linear",
+    "LinearGeneral",
+    "LoRA",
+    "LoRALinear",
+    "default_bias_init",
+    "default_kernel_init",
+]
