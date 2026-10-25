@@ -9,6 +9,7 @@ enforce:
   `locals`, `eval`, or `exec` in `src/zero_flax`
 - Zero dunder reflection attribute accesses (`__dict__`, `__setattr__`,
   `__getattribute__`, `__new__`, `__class__`) in `src/zero_flax`
+- Zero `assert` statements in `src/zero_flax`
 - Zero `# type: ignore` comments
 - Explicit parameter and return type annotations on every function and method
 """
@@ -60,7 +61,7 @@ def collect_python_files(paths: Sequence[str]) -> list[str]:
 
 
 def check_file(filepath: str) -> list[str]:
-    """Inspect a single Python file for typing, cast, and reflection violations.
+    """Inspect a single Python file for typing, cast, assert, and reflection violations.
 
     Args:
         filepath: Path to the Python source file to inspect.
@@ -84,6 +85,8 @@ def check_file(filepath: str) -> list[str]:
     tree = ast.parse(source, filename=filepath)
 
     for node in ast.walk(tree):
+        if is_src and isinstance(node, ast.Assert):
+            violations.append(f"{filepath}:{node.lineno}: forbidden 'assert' statement in src/")
         if isinstance(node, ast.ImportFrom):
             for alias in node.names:
                 if alias.name in ("Any", "cast"):

@@ -33,10 +33,25 @@ from zero_flax.types import (
     orthogonal_init,
     resolve_activation,
     resolve_initializer,
+    sanitize_dtype_str,
     sigmoid_fn,
     tanh_fn,
     zeros_init,
 )
+
+
+def _assert_cell_axis_dim(tensor: JaxArray, axis: int, expected: int) -> None:
+    """Validate that ``tensor`` has size ``expected`` along ``axis`` via ``zero_chex``.
+
+    Args:
+        tensor: Input or carry ``JaxArray`` to validate.
+        axis: Axis index to check.
+        expected: Expected dimension size along ``axis``.
+    """
+    from zero_chex.assertions import assert_axis_dimension
+
+    assert_axis_dimension(tensor, axis, expected)
+
 
 CarryType: TypeAlias = Union[JaxArray, Tuple[JaxArray, JaxArray]]
 
@@ -267,6 +282,8 @@ class SimpleCell(RNNCellBase):
         """
         h = carry[0] if isinstance(carry, tuple) else ensure_array(carry)
         x = ensure_array(inputs)
+        _assert_cell_axis_dim(h, -1, self.hidden_features)
+        _assert_cell_axis_dim(x, -1, self.in_features)
         act = resolve_activation(self.activation_fn)
         new_h = act(self.i2h(x) + self.h2h(h))
         if self.residual:
@@ -373,6 +390,7 @@ class GRUCell(RNNCellBase):
                 param_dtype=param_dtype,
                 kernel_init=kernel_init,
                 bias_init=bias_init,
+                promote_dtype=promote_dtype,
                 rngs=init_rngs,
                 kernel_metadata=kernel_metadata,
                 bias_metadata=bias_metadata,
@@ -388,6 +406,7 @@ class GRUCell(RNNCellBase):
                 param_dtype=param_dtype,
                 kernel_init=kernel_init,
                 bias_init=bias_init,
+                promote_dtype=promote_dtype,
                 rngs=init_rngs,
                 kernel_metadata=kernel_metadata,
                 bias_metadata=bias_metadata,
@@ -403,6 +422,7 @@ class GRUCell(RNNCellBase):
                 param_dtype=param_dtype,
                 kernel_init=kernel_init,
                 bias_init=bias_init,
+                promote_dtype=promote_dtype,
                 rngs=init_rngs,
                 kernel_metadata=kernel_metadata,
                 bias_metadata=bias_metadata,
@@ -417,6 +437,7 @@ class GRUCell(RNNCellBase):
                 dtype=dtype,
                 param_dtype=param_dtype,
                 kernel_init=recurrent_kernel_init,
+                promote_dtype=promote_dtype,
                 rngs=init_rngs,
                 kernel_metadata=recurrent_kernel_metadata,
             ),
@@ -430,6 +451,7 @@ class GRUCell(RNNCellBase):
                 dtype=dtype,
                 param_dtype=param_dtype,
                 kernel_init=recurrent_kernel_init,
+                promote_dtype=promote_dtype,
                 rngs=init_rngs,
                 kernel_metadata=recurrent_kernel_metadata,
             ),
@@ -444,6 +466,7 @@ class GRUCell(RNNCellBase):
                 param_dtype=param_dtype,
                 kernel_init=recurrent_kernel_init,
                 bias_init=bias_init,
+                promote_dtype=promote_dtype,
                 rngs=init_rngs,
                 kernel_metadata=recurrent_kernel_metadata,
                 bias_metadata=bias_metadata,
@@ -487,6 +510,8 @@ class GRUCell(RNNCellBase):
         """
         h = carry[0] if isinstance(carry, tuple) else ensure_array(carry)
         x = ensure_array(inputs)
+        _assert_cell_axis_dim(h, -1, self.hidden_features)
+        _assert_cell_axis_dim(x, -1, self.in_features)
         g_fn = resolve_activation(self.gate_fn)
         act_fn = resolve_activation(self.activation_fn)
 
@@ -597,6 +622,7 @@ class LSTMCell(RNNCellBase):
                 dtype=dtype,
                 param_dtype=param_dtype,
                 kernel_init=kernel_init,
+                promote_dtype=promote_dtype,
                 rngs=init_rngs,
                 kernel_metadata=kernel_metadata,
             ),
@@ -610,6 +636,7 @@ class LSTMCell(RNNCellBase):
                 dtype=dtype,
                 param_dtype=param_dtype,
                 kernel_init=kernel_init,
+                promote_dtype=promote_dtype,
                 rngs=init_rngs,
                 kernel_metadata=kernel_metadata,
             ),
@@ -623,6 +650,7 @@ class LSTMCell(RNNCellBase):
                 dtype=dtype,
                 param_dtype=param_dtype,
                 kernel_init=kernel_init,
+                promote_dtype=promote_dtype,
                 rngs=init_rngs,
                 kernel_metadata=kernel_metadata,
             ),
@@ -636,6 +664,7 @@ class LSTMCell(RNNCellBase):
                 dtype=dtype,
                 param_dtype=param_dtype,
                 kernel_init=kernel_init,
+                promote_dtype=promote_dtype,
                 rngs=init_rngs,
                 kernel_metadata=kernel_metadata,
             ),
@@ -650,6 +679,7 @@ class LSTMCell(RNNCellBase):
                 param_dtype=param_dtype,
                 kernel_init=recurrent_kernel_init,
                 bias_init=bias_init,
+                promote_dtype=promote_dtype,
                 rngs=init_rngs,
                 kernel_metadata=recurrent_kernel_metadata,
                 bias_metadata=bias_metadata,
@@ -665,6 +695,7 @@ class LSTMCell(RNNCellBase):
                 param_dtype=param_dtype,
                 kernel_init=recurrent_kernel_init,
                 bias_init=bias_init,
+                promote_dtype=promote_dtype,
                 rngs=init_rngs,
                 kernel_metadata=recurrent_kernel_metadata,
                 bias_metadata=bias_metadata,
@@ -680,6 +711,7 @@ class LSTMCell(RNNCellBase):
                 param_dtype=param_dtype,
                 kernel_init=recurrent_kernel_init,
                 bias_init=bias_init,
+                promote_dtype=promote_dtype,
                 rngs=init_rngs,
                 kernel_metadata=recurrent_kernel_metadata,
                 bias_metadata=bias_metadata,
@@ -695,6 +727,7 @@ class LSTMCell(RNNCellBase):
                 param_dtype=param_dtype,
                 kernel_init=recurrent_kernel_init,
                 bias_init=bias_init,
+                promote_dtype=promote_dtype,
                 rngs=init_rngs,
                 kernel_metadata=recurrent_kernel_metadata,
                 bias_metadata=bias_metadata,
@@ -747,6 +780,9 @@ class LSTMCell(RNNCellBase):
             c = ensure_array(carry)
             h = ensure_array(carry)
         x = ensure_array(inputs)
+        _assert_cell_axis_dim(c, -1, self.hidden_features)
+        _assert_cell_axis_dim(h, -1, self.hidden_features)
+        _assert_cell_axis_dim(x, -1, self.in_features)
         g_fn = resolve_activation(self.gate_fn)
         act_fn = resolve_activation(self.activation_fn)
 
@@ -847,6 +883,7 @@ class OptimizedLSTMCell(RNNCellBase):
                 dtype=dtype,
                 param_dtype=param_dtype,
                 kernel_init=kernel_init,
+                promote_dtype=promote_dtype,
                 rngs=init_rngs,
                 kernel_metadata=kernel_metadata,
             ),
@@ -861,6 +898,7 @@ class OptimizedLSTMCell(RNNCellBase):
                 param_dtype=param_dtype,
                 kernel_init=recurrent_kernel_init,
                 bias_init=bias_init,
+                promote_dtype=promote_dtype,
                 rngs=init_rngs,
                 kernel_metadata=recurrent_kernel_metadata,
                 bias_metadata=bias_metadata,
@@ -913,6 +951,9 @@ class OptimizedLSTMCell(RNNCellBase):
             c = ensure_array(carry)
             h = ensure_array(carry)
         x = ensure_array(inputs)
+        _assert_cell_axis_dim(c, -1, self.hidden_features)
+        _assert_cell_axis_dim(h, -1, self.hidden_features)
+        _assert_cell_axis_dim(x, -1, self.in_features)
         g_fn = resolve_activation(self.gate_fn)
         act_fn = resolve_activation(self.activation_fn)
 
@@ -1026,12 +1067,13 @@ class RNN(Module):
         )
 
         if seq_len == 0:
+            out_dt = sanitize_dtype_str(str(x.dtype).lower())
             empty_shape = (
                 (0, *step_shape[:-1], self.cell.hidden_features)
                 if tm
                 else (step_shape[0], 0, *step_shape[1:-1], self.cell.hidden_features)
             )
-            empty_seq: JaxArray = jnp.zeros(empty_shape)
+            empty_seq: JaxArray = jnp.zeros(empty_shape, dtype=out_dt)
             if ret_c:
                 return carry, empty_seq
             return empty_seq
@@ -1138,8 +1180,8 @@ class Bidirectional(Module):
         """
         tm = self.time_major if time_major is None else bool(time_major)
         ret_c = self.return_carry if return_carry is None else bool(return_carry)
-        bwd_rev = True if reverse is None else bool(reverse)
-        bwd_ko = True if keep_order is None else bool(keep_order)
+        bwd_rev = self.backward_rnn.reverse if reverse is None else bool(reverse)
+        bwd_ko = self.backward_rnn.keep_order if keep_order is None else bool(keep_order)
         fwd_init_c = initial_carry[0] if initial_carry is not None else None
         bwd_init_c = initial_carry[1] if initial_carry is not None else None
 
@@ -1148,8 +1190,8 @@ class Bidirectional(Module):
             initial_carry=fwd_init_c,
             return_carry=True,
             time_major=tm,
-            reverse=False,
-            keep_order=False,
+            reverse=self.forward_rnn.reverse,
+            keep_order=self.forward_rnn.keep_order,
         )
         bwd_res = self.backward_rnn(
             inputs,

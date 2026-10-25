@@ -12,10 +12,20 @@ from typing import Optional, Tuple, Union
 
 from typing_extensions import TypeAlias
 
-from zero_flax.nnx.variables import Variable, VariableValue
+from zero_flax.nnx.variables import AnyVariable, VariableBase, VariableValue
+from zero_flax.types import ArrayLike, JaxArray
 
 FilterTarget: TypeAlias = Union[
-    Variable[VariableValue], dict[str, VariableValue], int, float, str, bool, None
+    VariableBase,
+    AnyVariable,
+    dict[str, VariableValue],
+    JaxArray,
+    ArrayLike,
+    int,
+    float,
+    str,
+    bool,
+    None,
 ]
 FilterCallable: TypeAlias = Callable[[Tuple[str, ...], FilterTarget], bool]
 
@@ -128,12 +138,12 @@ class OfType(Filter):
     """Filter predicate matching variables that are instances of a target Variable class.
 
     Attributes:
-        target_type: The ``Variable`` class or type to match against.
+        target_type: The ``VariableBase`` class or type to match against.
     """
 
-    target_type: type[Variable[VariableValue]]
+    target_type: type[VariableBase]
 
-    def __init__(self, target_type: type[Variable[VariableValue]]) -> None:
+    def __init__(self, target_type: type[VariableBase]) -> None:
         """Initialize an OfType filter.
 
         Args:
@@ -157,7 +167,7 @@ class OfType(Filter):
 
 
 class PathContains(Filter):
-    """Filter predicate matching variables whose dotted path contains a target substring.
+    """Filter predicate matching variables whose path contains a target segment or substring.
 
     Attributes:
         key: Substring or path segment name to search for.
@@ -175,18 +185,21 @@ class PathContains(Filter):
         self.key = key
 
     def __call__(self, path: Tuple[str, ...], value: FilterTarget) -> bool:
-        """Check whether ``self.key`` appears in any segment of ``path``.
+        """Check whether ``self.key`` appears in any segment of ``path`` or slash/dot-joined path.
 
         Args:
             path: Tuple of string path segments.
             value: Candidate variable or state entry.
 
         Returns:
-            ``True`` if ``self.key`` is contained in the joined path or any segment.
+            ``True`` if ``self.key`` is contained in any segment or explicit slash/dot path.
         """
         _ = value
-        joined = "/".join(path)
-        return self.key in path or self.key in joined
+        if "/" in self.key:
+            return self.key in "/".join(path)
+        if "." in self.key:
+            return self.key in ".".join(path)
+        return any(self.key in seg for seg in path)
 
 
 class All(Filter):
@@ -284,7 +297,7 @@ class Not(Filter):
 
 FilterLiteral: TypeAlias = Union[
     Filter,
-    type[Variable[VariableValue]],
+    type[VariableBase],
     FilterCallable,
     Sequence["FilterLiteral"],
     str,
@@ -298,7 +311,8 @@ def to_predicate(filter_spec: FilterLiteral) -> Filter:
 
     Args:
         filter_spec: A ``Filter`` object, ``Variable`` subclass, callable predicate,
-            sequence of filter literals, path substring ``str``, ``bool``, or ``None``.
+            sequence of filter literals, ``Ellipsis`` (``...``), path substring ``str``,
+            ``bool``, or ``None``.
 
     Returns:
         Concrete ``Filter`` predicate object.

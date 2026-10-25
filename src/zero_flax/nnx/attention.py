@@ -38,7 +38,21 @@ from zero_flax.types import (
     default_promote_dtype,
     ensure_array,
     ones_init,
+    sanitize_dtype_str,
 )
+
+
+def _assert_axis_dim(tensor: JaxArray, axis: int, expected: int) -> None:
+    """Validate that ``tensor`` has size ``expected`` along ``axis`` via ``zero_chex``.
+
+    Args:
+        tensor: Input ``JaxArray`` to validate.
+        axis: Axis index to check.
+        expected: Expected dimension size along ``axis``.
+    """
+    from zero_chex.assertions import assert_axis_dimension
+
+    assert_axis_dimension(tensor, axis, expected)
 
 
 def _compute_attention_weights(
@@ -333,6 +347,7 @@ class MultiHeadAttention(Module):
         else:
             self.rngs = None
 
+        init_rngs: Union[Rngs, RngStream] = rngs if rngs is not None else Rngs(0)
         eff_out_k_init = kernel_init if out_kernel_init is None else out_kernel_init
         eff_out_b_init = bias_init if out_bias_init is None else out_bias_init
 
@@ -350,7 +365,7 @@ class MultiHeadAttention(Module):
                 promote_dtype=qkv_promote_dtype,
                 dot_general=qkv_dot_general,
                 dot_general_cls=qkv_dot_general_cls,
-                rngs=rngs,
+                rngs=init_rngs,
                 kernel_metadata=kernel_metadata,
                 bias_metadata=bias_metadata,
             ),
@@ -369,7 +384,7 @@ class MultiHeadAttention(Module):
                 promote_dtype=qkv_promote_dtype,
                 dot_general=qkv_dot_general,
                 dot_general_cls=qkv_dot_general_cls,
-                rngs=rngs,
+                rngs=init_rngs,
                 kernel_metadata=kernel_metadata,
                 bias_metadata=bias_metadata,
             ),
@@ -388,7 +403,7 @@ class MultiHeadAttention(Module):
                 promote_dtype=qkv_promote_dtype,
                 dot_general=qkv_dot_general,
                 dot_general_cls=qkv_dot_general_cls,
-                rngs=rngs,
+                rngs=init_rngs,
                 kernel_metadata=kernel_metadata,
                 bias_metadata=bias_metadata,
             ),
@@ -408,7 +423,7 @@ class MultiHeadAttention(Module):
                 promote_dtype=out_promote_dtype,
                 dot_general=out_dot_general,
                 dot_general_cls=out_dot_general_cls,
-                rngs=rngs,
+                rngs=init_rngs,
                 kernel_metadata=out_kernel_metadata,
                 bias_metadata=out_bias_metadata,
             ),
@@ -423,7 +438,7 @@ class MultiHeadAttention(Module):
                     param_dtype=param_dtype,
                     use_bias=False,
                     promote_dtype=ln_promote_dtype,
-                    rngs=rngs,
+                    rngs=init_rngs,
                     scale_metadata=query_ln_scale_metadata,
                 ),
             )
@@ -435,7 +450,7 @@ class MultiHeadAttention(Module):
                     param_dtype=param_dtype,
                     use_bias=False,
                     promote_dtype=ln_promote_dtype,
-                    rngs=rngs,
+                    rngs=init_rngs,
                     scale_metadata=key_ln_scale_metadata,
                 ),
             )
@@ -496,8 +511,8 @@ class MultiHeadAttention(Module):
 
         Raises:
             ValueError: If ``inputs_q`` is ``None``, if input feature dimensions do not match
-                ``in_features`` / ``in_kv_features``, or if ``decode=True`` is used before
-                ``init_cache()`` has been called.
+                ``in_features`` / ``in_kv_features``, if ``decode=True`` is used before
+                ``init_cache()`` has been called, or if the decoding cache overflows ``max_length``.
         """
         if inputs_q is None:
             raise ValueError("MultiHeadAttention requires a non-None inputs_q tensor.")
@@ -517,6 +532,9 @@ class MultiHeadAttention(Module):
             raise ValueError(
                 f"Expected inputs_v with last dimension {self.in_kv_features}, got shape {v_in.shape}."
             )
+        _assert_axis_dim(q_in, -1, self.in_features)
+        _assert_axis_dim(k_in, -1, self.in_kv_features)
+        _assert_axis_dim(v_in, -1, self.in_kv_features)
 
         orig_ndim = q_in.ndim
         added_seq_dim = False
@@ -548,6 +566,12 @@ class MultiHeadAttention(Module):
             cur_idx = int(self.cache_index.value)
             step_len = k_proj.shape[-3]
             max_len = self.cached_key.value.shape[-3]
+            after_idx = cur_idx + step_len
+            if after_idx > max_len:
+                raise ValueError(
+                    f"Autoregressive decoding cache overflow: cache_index ({cur_idx}) + "
+                    f"step_len ({step_len}) exceeds max_len ({max_len})."
+                )
             cur_k_cache = ensure_array(self.cached_key.value)
             cur_v_cache = ensure_array(self.cached_value.value)
             k_parts: list[JaxArray] = []
@@ -557,7 +581,6 @@ class MultiHeadAttention(Module):
                 v_parts.append(cur_v_cache[..., :cur_idx, :, :])
             k_parts.append(k_proj)
             v_parts.append(v_proj)
-            after_idx = cur_idx + step_len
             if after_idx < max_len:
                 k_parts.append(cur_k_cache[..., after_idx:, :, :])
                 v_parts.append(cur_v_cache[..., after_idx:, :, :])
@@ -567,8 +590,9 @@ class MultiHeadAttention(Module):
             k_proj = self.cached_key.value
             v_proj = self.cached_value.value
             if mask is None:
-                positions = jnp.arange(max_len)
-                mask = positions < after_idx
+                k_pos = jnp.reshape(jnp.arange(max_len), (1, max_len))
+                q_pos = jnp.reshape(jnp.arange(cur_idx, after_idx), (step_len, 1))
+                mask = k_pos <= q_pos
 
         det = bool(deterministic if deterministic is not None else self.deterministic)
         eff_rngs = rngs if rngs is not None else self.rngs
@@ -619,8 +643,10 @@ class MultiHeadAttention(Module):
                 module=self if sow_weights else None,
             )
             if sow_weights:
-                self.attention_weights = Intermediate(
-                    ensure_array(self._variables["attention_weights"].value)
+                sown_var = self._variables["attention_weights"]
+                self.attention_weights = self.register_variable(
+                    "attention_weights",
+                    Intermediate(ensure_array(sown_var.value)),
                 )
 
         output = self.out(attn_vec)
@@ -658,12 +684,23 @@ class RoPE(Module):
 
         Args:
             theta: Base rotational period $	heta$. Defaults to ``10000.0``.
-            embedding_size: Optional feature dimension size (inferred from input if ``None``).
+            embedding_size: Optional even feature dimension size (inferred from input if ``None``).
             max_seq_len: Optional maximum sequence length cap.
+
+        Raises:
+            ValueError: If ``embedding_size`` is provided and is not a positive even integer.
         """
         super().__init__()
         self.theta = float(theta)
-        self.embedding_size = None if embedding_size is None else int(embedding_size)
+        if embedding_size is not None:
+            emb_sz = int(embedding_size)
+            if emb_sz <= 0 or emb_sz % 2 != 0:
+                raise ValueError(
+                    f"RoPE embedding_size must be a positive even integer, got {embedding_size}."
+                )
+            self.embedding_size = emb_sz
+        else:
+            self.embedding_size = None
         self.max_seq_len = None if max_seq_len is None else int(max_seq_len)
         self.finish_init()
 
@@ -683,14 +720,23 @@ class RoPE(Module):
             positions: Optional explicit position indices of shape ``(seq_len,)`` or ``(*batch, seq_len)``.
 
         Returns:
-            Position-rotated ``JaxArray`` of the same shape as ``inputs``.
+            Position-rotated ``JaxArray`` of the same shape and dtype as ``inputs``.
+
+        Raises:
+            ValueError: If ``inputs`` has fewer than ``embedding_size`` features in its last dimension.
         """
         x = ensure_array(inputs)
         if x.ndim < 2:
             return x
+        if self.embedding_size is not None and x.shape[-1] < self.embedding_size:
+            raise ValueError(
+                f"RoPE input last dimension ({x.shape[-1]}) is smaller than "
+                f"embedding_size ({self.embedding_size})."
+            )
+        _assert_axis_dim(x, -1, x.shape[-1])
         feat_dim = self.embedding_size if self.embedding_size is not None else x.shape[-1]
-        half_dim = max(1, feat_dim // 2)
-        if x.shape[-1] < 2 * half_dim:
+        half_dim = feat_dim // 2
+        if half_dim == 0:
             return x
 
         seq_axis = -3 if x.ndim >= 4 else -2
@@ -704,10 +750,11 @@ class RoPE(Module):
             pos = jnp.minimum(pos, float(max(0, self.max_seq_len - 1)))
 
         freq_indices = jnp.arange(half_dim, dtype="float32")
-        inv_freq = 1.0 / (self.theta ** (2.0 * freq_indices / float(max(2, feat_dim))))
+        inv_freq = 1.0 / (self.theta ** (2.0 * freq_indices / float(max(2, 2 * half_dim))))
         angles = jnp.outer(jnp.reshape(pos, (-1,)), inv_freq)
-        cos_val = jnp.cos(angles)
-        sin_val = jnp.sin(angles)
+        in_dt = sanitize_dtype_str(str(x.dtype).lower())
+        cos_val = ensure_array(jnp.cos(angles), dtype=in_dt)
+        sin_val = ensure_array(jnp.sin(angles), dtype=in_dt)
 
         x1 = x[..., :half_dim]
         x2 = x[..., half_dim : 2 * half_dim]
@@ -749,7 +796,7 @@ class PReLU(Module):
 
     def __init__(
         self,
-        negative_slope_init: float = 0.01,
+        negative_slope_init: Union[float, ArrayLike] = 0.01,
         *,
         dtype: Optional[DType] = None,
         param_dtype: DType = "float32",
@@ -759,19 +806,21 @@ class PReLU(Module):
         r"""Initialize a PReLU activation module.
 
         Args:
-            negative_slope_init: Initial scalar value for the negative slope parameter. Defaults to ``0.01``.
+            negative_slope_init: Initial scalar or array value for the negative slope parameter. Defaults to ``0.01``.
             dtype: Computation data type.
             param_dtype: Parameter initialization data type.
             promote_dtype: Dtype promotion callable.
             negative_slope_metadata: Metadata mapping attached to ``negative_slope``.
         """
         super().__init__()
-        self.negative_slope_init = float(negative_slope_init)
+        slope_arr = ensure_array(negative_slope_init, dtype=param_dtype)
+        self.negative_slope_init = (
+            float(negative_slope_init) if isinstance(negative_slope_init, (int, float)) else 0.01
+        )
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.promote_dtype = promote_dtype
         meta = dict(negative_slope_metadata) if negative_slope_metadata is not None else {}
-        slope_arr = ensure_array(self.negative_slope_init, dtype=param_dtype)
         self.negative_slope = self.register_variable(
             "negative_slope",
             Param(slope_arr, **meta),
@@ -787,8 +836,8 @@ class PReLU(Module):
         Returns:
             Activated ``JaxArray`` where negative elements are scaled by ``self.negative_slope``.
         """
-        x = ensure_array(inputs)
-        slope = ensure_array(self.negative_slope.value)
+        x = ensure_array(inputs, dtype=self.dtype)
+        slope = ensure_array(self.negative_slope.value, dtype=self.dtype)
         if self.promote_dtype is not None:
             promoted = self.promote_dtype(x, slope, dtype=self.dtype)
             x, slope = promoted[0], promoted[1]

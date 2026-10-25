@@ -13,9 +13,9 @@ from typing import Optional, Tuple, Union
 from zero_jax import numpy as jnp
 
 from zero_flax.nnx.filterlib import FilterLiteral, PathContains, to_predicate
-from zero_flax.nnx.module import Module
+from zero_flax.nnx.module import Module, iter_graph
 from zero_flax.nnx.rnglib import Rngs, RngStream, resolve_rng_key
-from zero_flax.nnx.variables import BatchStat, Param, Variable, VariableValue
+from zero_flax.nnx.variables import AnyVariable, BatchStat, Param
 from zero_flax.types import (
     EMPTY_METADATA,
     ArrayLike,
@@ -32,6 +32,13 @@ from zero_flax.types import (
     resolve_initializer,
     zeros_init,
 )
+
+
+class _UnsetGroupSentinel:
+    """Sentinel class distinguishing omitted ``num_groups`` from an explicit integer."""
+
+
+_UNSET_GROUPS = _UnsetGroupSentinel()
 
 
 def _invoke_wrapped_layer(layer: Module, x: ArrayLike) -> JaxArray:
@@ -75,8 +82,9 @@ def _compute_moments(
     mask: Optional[ArrayLike] = None,
     keepdims: bool = True,
     subtract_mean: bool = True,
+    use_fast_variance: bool = True,
 ) -> Tuple[JaxArray, JaxArray]:
-    """Compute (optionally masked) mean and variance of ``arr`` along ``red_axes``.
+    r"""Compute (optionally masked) mean and variance of ``arr`` along ``red_axes``.
 
     Args:
         arr: Input tensor.
@@ -84,16 +92,24 @@ def _compute_moments(
         mask: Optional boolean/numeric mask broadcastable to ``arr.shape``.
         keepdims: Whether reduced axes are retained with size ``1``.
         subtract_mean: Whether to center ``arr`` by its mean when computing variance.
+        use_fast_variance: If ``True`` and ``subtract_mean`` is ``True``, compute variance via
+            $\max(0, \mathbb{E}[x^2] - \mathbb{E}[x]^2)$; otherwise compute $\mathbb{E}[(x - \mu)^2]$.
 
     Returns:
         Pair ``(mean, var)`` of ``JaxArray`` tensors.
     """
+    if len(red_axes) == 0:
+        return arr, jnp.zeros(arr.shape)
     if mask is None:
         mean: JaxArray = jnp.mean(arr, axis=red_axes, keepdims=keepdims)
         if subtract_mean:
-            mean_kd = mean if keepdims else jnp.expand_dims(mean, axis=red_axes)
-            diff = arr - mean_kd
-            var: JaxArray = jnp.mean(diff * diff, axis=red_axes, keepdims=keepdims)
+            if use_fast_variance:
+                mean_sq: JaxArray = jnp.mean(arr * arr, axis=red_axes, keepdims=keepdims)
+                var: JaxArray = jnp.maximum(0.0, mean_sq - mean * mean)
+            else:
+                mean_kd = mean if keepdims else jnp.expand_dims(mean, axis=red_axes)
+                diff = arr - mean_kd
+                var = jnp.mean(diff * diff, axis=red_axes, keepdims=keepdims)
         else:
             var = jnp.mean(arr * arr, axis=red_axes, keepdims=keepdims)
         return mean, var
@@ -103,9 +119,13 @@ def _compute_moments(
     denom: JaxArray = jnp.maximum(jnp.sum(m_b, axis=red_axes, keepdims=keepdims), 1.0)
     mean = jnp.sum(arr * m_b, axis=red_axes, keepdims=keepdims) / denom
     if subtract_mean:
-        mean_kd = mean if keepdims else jnp.expand_dims(mean, axis=red_axes)
-        diff = (arr - mean_kd) * m_b
-        var = jnp.sum(diff * diff, axis=red_axes, keepdims=keepdims) / denom
+        if use_fast_variance:
+            mean_sq = jnp.sum(arr * arr * m_b, axis=red_axes, keepdims=keepdims) / denom
+            var = jnp.maximum(0.0, mean_sq - mean * mean)
+        else:
+            mean_kd = mean if keepdims else jnp.expand_dims(mean, axis=red_axes)
+            diff = (arr - mean_kd) * m_b
+            var = jnp.sum(diff * diff, axis=red_axes, keepdims=keepdims) / denom
     else:
         var = jnp.sum(arr * arr * m_b, axis=red_axes, keepdims=keepdims) / denom
     return mean, var
@@ -260,6 +280,24 @@ class BatchNorm(Module):
             Normalized ``JaxArray`` of the same shape as ``x``.
         """
         arr = ensure_array(x, dtype=self.dtype)
+        s_raw: Optional[JaxArray] = (
+            ensure_array(self.scale.value, dtype=self.dtype)
+            if (self.use_scale and self.scale is not None)
+            else None
+        )
+        b_raw: Optional[JaxArray] = (
+            ensure_array(self.bias.value, dtype=self.dtype)
+            if (self.use_bias and self.bias is not None)
+            else None
+        )
+        if self.promote_dtype is not None:
+            promoted = self.promote_dtype(arr, s_raw, b_raw, dtype=self.dtype)
+            arr = promoted[0]
+            if s_raw is not None:
+                s_raw = promoted[1]
+            if b_raw is not None:
+                b_raw = promoted[2]
+
         use_ra = (
             use_running_average
             if use_running_average is not None
@@ -278,6 +316,9 @@ class BatchNorm(Module):
                 mask=mask,
                 keepdims=False,
                 subtract_mean=self.subtract_mean,
+                use_fast_variance=bool(
+                    True if self.use_fast_variance is None else self.use_fast_variance
+                ),
             )
             if self.subtract_mean:
                 self.mean.value = (
@@ -294,13 +335,11 @@ class BatchNorm(Module):
         centered = (arr - mean_b) if self.subtract_mean else arr
         normed: JaxArray = centered / jnp.sqrt(var_b + self.epsilon)
 
-        if self.use_scale and self.scale is not None:
-            s_val = ensure_array(self.scale.value, dtype=self.dtype)
-            s_b = jnp.reshape(s_val, tuple(bcast_shape)) if arr.ndim > 1 else s_val
+        if s_raw is not None:
+            s_b = jnp.reshape(s_raw, tuple(bcast_shape)) if arr.ndim > 1 else s_raw
             normed = normed * s_b
-        if self.use_bias and self.bias is not None:
-            b_val = ensure_array(self.bias.value, dtype=self.dtype)
-            b_b = jnp.reshape(b_val, tuple(bcast_shape)) if arr.ndim > 1 else b_val
+        if b_raw is not None:
+            b_b = jnp.reshape(b_raw, tuple(bcast_shape)) if arr.ndim > 1 else b_raw
             normed = normed + b_b
         return normed
 
@@ -320,6 +359,7 @@ class LayerNorm(Module):
     """
 
     num_features: int
+    feature_shape: Tuple[int, ...]
     epsilon: float
     dtype: Optional[DType]
     param_dtype: DType
@@ -336,7 +376,7 @@ class LayerNorm(Module):
 
     def __init__(
         self,
-        num_features: int,
+        num_features: Union[int, Sequence[int]],
         *,
         epsilon: float = 1e-06,
         dtype: Optional[DType] = None,
@@ -358,7 +398,7 @@ class LayerNorm(Module):
         r"""Initialize a LayerNorm module.
 
         Args:
-            num_features: Number of feature channels to normalize.
+            num_features: Number of feature channels (or sequence of feature dimensions) to normalize.
             epsilon: Small float added to variance to avoid division by zero.
             dtype: Computation data type.
             param_dtype: Parameter initialization data type.
@@ -377,7 +417,12 @@ class LayerNorm(Module):
             scale_metadata: Metadata attached to ``scale``.
         """
         super().__init__()
-        self.num_features = int(num_features)
+        if isinstance(num_features, int):
+            self.num_features = int(num_features)
+            self.feature_shape = (self.num_features,)
+        else:
+            self.feature_shape = tuple(int(f) for f in num_features)
+            self.num_features = self.feature_shape[-1] if len(self.feature_shape) > 0 else 1
         self.epsilon = float(epsilon)
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -396,7 +441,7 @@ class LayerNorm(Module):
             s_meta = dict(scale_metadata) if scale_metadata is not None else {}
             self.scale = self.register_variable(
                 "scale",
-                Param(s_fn(s_key, (self.num_features,), param_dtype), **s_meta),
+                Param(s_fn(s_key, self.feature_shape, param_dtype), **s_meta),
             )
         else:
             self.scale = None
@@ -407,7 +452,7 @@ class LayerNorm(Module):
             b_meta = dict(bias_metadata) if bias_metadata is not None else {}
             self.bias = self.register_variable(
                 "bias",
-                Param(b_fn(b_key, (self.num_features,), param_dtype), **b_meta),
+                Param(b_fn(b_key, self.feature_shape, param_dtype), **b_meta),
             )
         else:
             self.bias = None
@@ -429,8 +474,33 @@ class LayerNorm(Module):
             Layer-normalized ``JaxArray`` of the same shape as ``x``.
         """
         arr = ensure_array(x, dtype=self.dtype)
+        s_raw: Optional[JaxArray] = (
+            ensure_array(self.scale.value, dtype=self.dtype)
+            if (self.use_scale and self.scale is not None)
+            else None
+        )
+        b_raw: Optional[JaxArray] = (
+            ensure_array(self.bias.value, dtype=self.dtype)
+            if (self.use_bias and self.bias is not None)
+            else None
+        )
+        if self.promote_dtype is not None:
+            promoted = self.promote_dtype(arr, s_raw, b_raw, dtype=self.dtype)
+            arr = promoted[0]
+            if s_raw is not None:
+                s_raw = promoted[1]
+            if b_raw is not None:
+                b_raw = promoted[2]
+
         red_axes = _normalize_axes(self.reduction_axes, arr.ndim)
-        mean, var = _compute_moments(arr, red_axes, mask=mask, keepdims=True, subtract_mean=True)
+        mean, var = _compute_moments(
+            arr,
+            red_axes,
+            mask=mask,
+            keepdims=True,
+            subtract_mean=True,
+            use_fast_variance=self.use_fast_variance,
+        )
         normed: JaxArray = (arr - mean) / jnp.sqrt(var + self.epsilon)
 
         feat_axes = _normalize_axes(self.feature_axes, arr.ndim)
@@ -438,13 +508,11 @@ class LayerNorm(Module):
         for ax in feat_axes:
             bcast_shape[ax] = arr.shape[ax]
 
-        if self.use_scale and self.scale is not None:
-            s_val = ensure_array(self.scale.value, dtype=self.dtype)
-            s_b = jnp.reshape(s_val, tuple(bcast_shape)) if arr.ndim > 1 else s_val
+        if s_raw is not None:
+            s_b = jnp.reshape(s_raw, tuple(bcast_shape)) if arr.ndim > 1 else s_raw
             normed = normed * s_b
-        if self.use_bias and self.bias is not None:
-            b_val = ensure_array(self.bias.value, dtype=self.dtype)
-            b_b = jnp.reshape(b_val, tuple(bcast_shape)) if arr.ndim > 1 else b_val
+        if b_raw is not None:
+            b_b = jnp.reshape(b_raw, tuple(bcast_shape)) if arr.ndim > 1 else b_raw
             normed = normed + b_b
         return normed
 
@@ -462,6 +530,7 @@ class RMSNorm(Module):
     """
 
     num_features: int
+    feature_shape: Tuple[int, ...]
     epsilon: float
     dtype: Optional[DType]
     param_dtype: DType
@@ -476,7 +545,7 @@ class RMSNorm(Module):
 
     def __init__(
         self,
-        num_features: int,
+        num_features: Union[int, Sequence[int]],
         *,
         epsilon: float = 1e-06,
         dtype: Optional[DType] = None,
@@ -495,7 +564,7 @@ class RMSNorm(Module):
         r"""Initialize an RMSNorm module.
 
         Args:
-            num_features: Size of the normalized feature dimension.
+            num_features: Size of the normalized feature dimension (or sequence of dimensions).
             epsilon: Small float added inside the square root for stability.
             dtype: Computation data type.
             param_dtype: Parameter initialization data type.
@@ -511,7 +580,12 @@ class RMSNorm(Module):
             scale_metadata: Metadata mapping attached to ``scale``.
         """
         super().__init__()
-        self.num_features = int(num_features)
+        if isinstance(num_features, int):
+            self.num_features = int(num_features)
+            self.feature_shape = (self.num_features,)
+        else:
+            self.feature_shape = tuple(int(f) for f in num_features)
+            self.num_features = self.feature_shape[-1] if len(self.feature_shape) > 0 else 1
         self.epsilon = float(epsilon)
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -529,7 +603,7 @@ class RMSNorm(Module):
             s_meta = dict(scale_metadata) if scale_metadata is not None else {}
             self.scale = self.register_variable(
                 "scale",
-                Param(s_fn(s_key, (self.num_features,), param_dtype), **s_meta),
+                Param(s_fn(s_key, self.feature_shape, param_dtype), **s_meta),
             )
         else:
             self.scale = None
@@ -551,16 +625,33 @@ class RMSNorm(Module):
             RMS-normalized ``JaxArray`` of the same shape as ``x``.
         """
         arr = ensure_array(x, dtype=self.dtype)
+        s_raw: Optional[JaxArray] = (
+            ensure_array(self.scale.value, dtype=self.dtype)
+            if (self.use_scale and self.scale is not None)
+            else None
+        )
+        if self.promote_dtype is not None:
+            promoted = self.promote_dtype(arr, s_raw, dtype=self.dtype)
+            arr = promoted[0]
+            if s_raw is not None:
+                s_raw = promoted[1]
+
         red_axes = _normalize_axes(self.reduction_axes, arr.ndim)
-        _, mean_sq = _compute_moments(arr, red_axes, mask=mask, keepdims=True, subtract_mean=False)
+        _, mean_sq = _compute_moments(
+            arr,
+            red_axes,
+            mask=mask,
+            keepdims=True,
+            subtract_mean=False,
+            use_fast_variance=self.use_fast_variance,
+        )
         normed: JaxArray = arr / jnp.sqrt(mean_sq + self.epsilon)
-        if self.use_scale and self.scale is not None:
+        if s_raw is not None:
             feat_axes = _normalize_axes(self.feature_axes, arr.ndim)
             bcast_shape = [1] * arr.ndim
             for ax in feat_axes:
                 bcast_shape[ax] = arr.shape[ax]
-            s_val = ensure_array(self.scale.value, dtype=self.dtype)
-            s_b = jnp.reshape(s_val, tuple(bcast_shape)) if arr.ndim > 1 else s_val
+            s_b = jnp.reshape(s_raw, tuple(bcast_shape)) if arr.ndim > 1 else s_raw
             normed = normed * s_b
         return normed
 
@@ -598,7 +689,7 @@ class GroupNorm(Module):
     def __init__(
         self,
         num_features: int,
-        num_groups: Optional[int] = 32,
+        num_groups: Union[int, None, _UnsetGroupSentinel] = _UNSET_GROUPS,
         group_size: Optional[int] = None,
         *,
         epsilon: float = 1e-06,
@@ -640,22 +731,27 @@ class GroupNorm(Module):
             scale_metadata: Metadata mapping attached to ``scale``.
 
         Raises:
-            ValueError: If neither or incompatible ``num_groups`` / ``group_size`` are given.
+            ValueError: If both ``num_groups`` and ``group_size`` are specified, if both are ``None``,
+                or if ``num_features`` is not divisible by ``num_groups`` / ``group_size``.
         """
         super().__init__()
         self.num_features = int(num_features)
+        explicit_ng = not isinstance(num_groups, _UnsetGroupSentinel) and num_groups is not None
+        if explicit_ng and group_size is not None:
+            raise ValueError("Cannot specify both 'num_groups' and 'group_size' in GroupNorm.")
         if group_size is not None:
             gs = int(group_size)
-            if self.num_features % gs != 0:
+            if gs <= 0 or self.num_features % gs != 0:
                 raise ValueError(
                     f"num_features ({self.num_features}) must be divisible by group_size ({gs})."
                 )
             self.group_size = gs
             self.num_groups = self.num_features // gs
         else:
-            raw_ng = int(num_groups) if num_groups is not None else 32
-            ng = self.num_features if (raw_ng == 32 and self.num_features < 32) else raw_ng
-            if self.num_features % ng != 0:
+            if num_groups is None:
+                raise ValueError("Either 'num_groups' or 'group_size' must be specified.")
+            ng = 32 if isinstance(num_groups, _UnsetGroupSentinel) else int(num_groups)
+            if ng <= 0 or self.num_features % ng != 0:
                 raise ValueError(
                     f"num_features ({self.num_features}) must be divisible by num_groups ({ng})."
                 )
@@ -712,6 +808,24 @@ class GroupNorm(Module):
             Group-normalized ``JaxArray`` of the same shape as ``x``.
         """
         arr = ensure_array(x, dtype=self.dtype)
+        s_raw: Optional[JaxArray] = (
+            ensure_array(self.scale.value, dtype=self.dtype)
+            if (self.use_scale and self.scale is not None)
+            else None
+        )
+        b_raw: Optional[JaxArray] = (
+            ensure_array(self.bias.value, dtype=self.dtype)
+            if (self.use_bias and self.bias is not None)
+            else None
+        )
+        if self.promote_dtype is not None:
+            promoted = self.promote_dtype(arr, s_raw, b_raw, dtype=self.dtype)
+            arr = promoted[0]
+            if s_raw is not None:
+                s_raw = promoted[1]
+            if b_raw is not None:
+                b_raw = promoted[2]
+
         orig_shape = arr.shape
         grouped_shape = (*orig_shape[:-1], self.num_groups, self.group_size)
         grouped = jnp.reshape(arr, grouped_shape)
@@ -728,14 +842,19 @@ class GroupNorm(Module):
             grouped_mask = jnp.reshape(m_full, grouped_shape)
 
         mean, var = _compute_moments(
-            grouped, red_axes, mask=grouped_mask, keepdims=True, subtract_mean=True
+            grouped,
+            red_axes,
+            mask=grouped_mask,
+            keepdims=True,
+            subtract_mean=True,
+            use_fast_variance=self.use_fast_variance,
         )
         normed: JaxArray = jnp.reshape((grouped - mean) / jnp.sqrt(var + self.epsilon), orig_shape)
 
-        if self.use_scale and self.scale is not None:
-            normed = normed * ensure_array(self.scale.value, dtype=self.dtype)
-        if self.use_bias and self.bias is not None:
-            normed = normed + ensure_array(self.bias.value, dtype=self.dtype)
+        if s_raw is not None:
+            normed = normed * s_raw
+        if b_raw is not None:
+            normed = normed + b_raw
         return normed
 
 
@@ -850,35 +969,76 @@ class InstanceNorm(Module):
     ) -> JaxArray:
         r"""Apply Instance Normalization across spatial axes of ``x``.
 
+        In accordance with ``flax.nnx.InstanceNorm``, reduction is performed over all axes
+        except axis ``0`` (batch) and ``self.feature_axes``.
+
         Args:
-            x: Input tensor of shape ``(batch, *spatial, num_features)`` or ``(*spatial, num_features)``.
+            x: Input tensor of shape ``(batch, *spatial, num_features)``.
             mask: Optional boolean mask.
 
         Returns:
             Instance-normalized ``JaxArray`` of the same shape as ``x``.
         """
         arr = ensure_array(x, dtype=self.dtype)
-        feat_axes = _normalize_axes(self.feature_axes, arr.ndim)
-        spatial_axes = tuple(
-            i for i in range(1 if arr.ndim > 2 else 0, arr.ndim) if i not in feat_axes
+        s_raw: Optional[JaxArray] = (
+            ensure_array(self.scale.value, dtype=self.dtype)
+            if (self.use_scale and self.scale is not None)
+            else None
         )
-        red_axes = spatial_axes if len(spatial_axes) > 0 else feat_axes
-        mean, var = _compute_moments(arr, red_axes, mask=mask, keepdims=True, subtract_mean=True)
+        b_raw: Optional[JaxArray] = (
+            ensure_array(self.bias.value, dtype=self.dtype)
+            if (self.use_bias and self.bias is not None)
+            else None
+        )
+        if self.promote_dtype is not None:
+            promoted = self.promote_dtype(arr, s_raw, b_raw, dtype=self.dtype)
+            arr = promoted[0]
+            if s_raw is not None:
+                s_raw = promoted[1]
+            if b_raw is not None:
+                b_raw = promoted[2]
+
+        feat_axes = _normalize_axes(self.feature_axes, arr.ndim)
+        red_axes = tuple(i for i in range(1, arr.ndim) if i not in feat_axes)
+        mean, var = _compute_moments(
+            arr,
+            red_axes,
+            mask=mask,
+            keepdims=True,
+            subtract_mean=True,
+            use_fast_variance=self.use_fast_variance,
+        )
         normed: JaxArray = (arr - mean) / jnp.sqrt(var + self.epsilon)
 
         bcast_shape = [1] * arr.ndim
         for ax in feat_axes:
             bcast_shape[ax] = arr.shape[ax]
 
-        if self.use_scale and self.scale is not None:
-            s_val = ensure_array(self.scale.value, dtype=self.dtype)
-            s_b = jnp.reshape(s_val, tuple(bcast_shape)) if arr.ndim > 1 else s_val
+        if s_raw is not None:
+            s_b = jnp.reshape(s_raw, tuple(bcast_shape)) if arr.ndim > 1 else s_raw
             normed = normed * s_b
-        if self.use_bias and self.bias is not None:
-            b_val = ensure_array(self.bias.value, dtype=self.dtype)
-            b_b = jnp.reshape(b_val, tuple(bcast_shape)) if arr.ndim > 1 else b_val
+        if b_raw is not None:
+            b_b = jnp.reshape(b_raw, tuple(bcast_shape)) if arr.ndim > 1 else b_raw
             normed = normed + b_b
         return normed
+
+
+def _find_first_matrix_param(layer: Module) -> Optional[AnyVariable]:
+    """Find the primary weight ``Param`` inside ``layer`` (preferring ``"kernel"``).
+
+    Args:
+        layer: Target ``Module`` to inspect.
+
+    Returns:
+        Matched ``Param`` / ``Variable`` or ``None`` if no parameters exist.
+    """
+    layer._ensure_registries()
+    if "kernel" in layer._variables:
+        return layer._variables["kernel"]
+    for _, node in iter_graph(layer):
+        if isinstance(node, Param):
+            return node
+    return None
 
 
 class SpectralNorm(Module):
@@ -889,7 +1049,7 @@ class SpectralNorm(Module):
     during the forward pass.
 
     Attributes:
-        layer_instance: Wrapped ``Module`` instance containing a ``kernel`` parameter.
+        layer_instance: Wrapped ``Module`` instance containing a weight parameter.
         n_steps: Number of power iteration steps per forward pass.
         epsilon: Small constant for vector normalization stability.
         error_on_non_matrix: Whether to raise a ``ValueError`` if a parameter is 1D/scalar.
@@ -947,18 +1107,21 @@ class SpectralNorm(Module):
         self.update_stats = bool(update_stats)
         _ = rngs
 
-        self.layer_instance._ensure_registries()
-        kernel_var = self.layer_instance._variables.get("kernel")
+        kernel_var = _find_first_matrix_param(self.layer_instance)
         if kernel_var is not None:
-            k_arr = ensure_array(kernel_var.value)
+            k_arr = ensure_array(kernel_var.value, dtype=param_dtype)
             if k_arr.ndim < 2 and self.error_on_non_matrix:
                 raise ValueError("SpectralNorm requires a weight tensor with ndim >= 2.")
             rows = int(k_arr.shape[0]) if k_arr.ndim >= 1 else 1
             cols = 1
             for d in k_arr.shape[1:]:
                 cols *= int(d)
-            self.u = self.register_variable("u", BatchStat(jnp.ones((rows,)) / (rows**0.5)))
-            self.v = self.register_variable("v", BatchStat(jnp.ones((cols,)) / (cols**0.5)))
+            self.u = self.register_variable(
+                "u", BatchStat(ensure_array(jnp.ones((rows,)) / (rows**0.5), dtype=param_dtype))
+            )
+            self.v = self.register_variable(
+                "v", BatchStat(ensure_array(jnp.ones((cols,)) / (cols**0.5), dtype=param_dtype))
+            )
         else:
             self.u = None
             self.v = None
@@ -980,14 +1143,13 @@ class SpectralNorm(Module):
             Output ``JaxArray`` from ``self.layer_instance(x)``.
         """
         do_update = self.update_stats if update_stats is None else bool(update_stats)
-        self.layer_instance._ensure_registries()
-        kernel_var = self.layer_instance._variables.get("kernel")
+        kernel_var = _find_first_matrix_param(self.layer_instance)
         if kernel_var is not None and self.u is not None and self.v is not None:
-            orig_k = ensure_array(kernel_var.value)
+            orig_k = ensure_array(kernel_var.value, dtype=self.dtype)
             rows = orig_k.shape[0]
             w_mat = jnp.reshape(orig_k, (rows, -1))
-            u_vec = ensure_array(self.u.value)
-            v_vec = ensure_array(self.v.value)
+            u_vec = ensure_array(self.u.value, dtype=self.dtype)
+            v_vec = ensure_array(self.v.value, dtype=self.dtype)
             for _ in range(self.n_steps):
                 v_raw = jnp.dot(jnp.transpose(w_mat), u_vec)
                 v_norm = jnp.sqrt(jnp.sum(v_raw * v_raw) + self.epsilon)
@@ -1021,7 +1183,8 @@ class WeightNorm(Module):
         use_scale: Whether to multiply normalized weights by a learnable direction scale ``g``.
         epsilon: Small constant added to the L2 norm for numerical stability.
         variable_filter: Filter selecting which parameter(s) of ``layer_instance`` to normalize.
-        scale: Optional learnable magnitude ``Param`` ``g``.
+        scale: Primary learnable magnitude ``Param`` ``g`` (for the first matched parameter).
+        scales: Dictionary mapping matched variable names to their respective ``Param`` scales.
     """
 
     layer_instance: Module
@@ -1033,6 +1196,7 @@ class WeightNorm(Module):
     variable_filter: FilterLiteral
     promote_dtype: PromoteDtypeFn
     scale: Optional[Param[JaxArray]]
+    scales: dict[str, Param[JaxArray]]
 
     def __init__(
         self,
@@ -1071,26 +1235,30 @@ class WeightNorm(Module):
         self.param_dtype = param_dtype
         self.variable_filter = variable_filter
         self.promote_dtype = promote_dtype
+        self.scales = {}
+        self.scale = None
 
         self.layer_instance._ensure_registries()
         predicate = to_predicate(self.variable_filter)
-        matched_var: Optional[Variable[VariableValue]] = None
+        s_fn = resolve_initializer(scale_init, ones_init)
+        fold_idx = 0
         for v_name, v_obj in self.layer_instance._variables.items():
-            if predicate((v_name,), v_obj):
-                matched_var = v_obj
-                break
-        if self.use_scale and matched_var is not None:
-            k_arr = ensure_array(matched_var.value)
-            f_axes = _normalize_axes(self.feature_axes, k_arr.ndim)
-            scale_shape = tuple(int(k_arr.shape[ax]) for ax in f_axes) if k_arr.ndim >= 1 else (1,)
-            s_fn = resolve_initializer(scale_init, ones_init)
-            s_key = resolve_rng_key(rngs, "params", fold_index=0)
-            self.scale = self.register_variable(
-                "scale",
-                Param(s_fn(s_key, scale_shape, param_dtype)),
-            )
-        else:
-            self.scale = None
+            if predicate((v_name,), v_obj) and self.use_scale:
+                k_arr = ensure_array(v_obj.value)
+                f_axes = _normalize_axes(self.feature_axes, k_arr.ndim)
+                scale_shape = (
+                    tuple(int(k_arr.shape[ax]) for ax in f_axes) if k_arr.ndim >= 1 else (1,)
+                )
+                s_key = resolve_rng_key(rngs, "params", fold_index=fold_idx)
+                fold_idx += 1
+                reg_name = "scale" if len(self.scales) == 0 else f"scale_{v_name}"
+                s_param = self.register_variable(
+                    reg_name,
+                    Param(s_fn(s_key, scale_shape, param_dtype)),
+                )
+                self.scales[v_name] = s_param
+                if self.scale is None:
+                    self.scale = s_param
         self.finish_init()
 
     def __call__(self, x: ArrayLike) -> JaxArray:
@@ -1109,18 +1277,30 @@ class WeightNorm(Module):
             if predicate((v_name,), v_obj):
                 orig_w = ensure_array(v_obj.value)
                 saved[v_name] = orig_w
-                f_axes = _normalize_axes(self.feature_axes, orig_w.ndim)
-                red_axes = tuple(i for i in range(orig_w.ndim) if i not in f_axes)
-                norm = jnp.sqrt(
-                    jnp.sum(orig_w * orig_w, axis=red_axes, keepdims=True) + self.epsilon
+                w_work = ensure_array(orig_w, dtype=self.dtype)
+                s_param = self.scales.get(v_name, self.scale)
+                s_val: Optional[JaxArray] = (
+                    ensure_array(s_param.value, dtype=self.dtype)
+                    if (self.use_scale and s_param is not None)
+                    else None
                 )
-                normed_w = orig_w / norm
-                if self.use_scale and self.scale is not None:
-                    s_val = ensure_array(self.scale.value, dtype=self.dtype)
-                    if orig_w.ndim > 1:
-                        bcast_shape = [1] * orig_w.ndim
+                if self.promote_dtype is not None:
+                    promoted = self.promote_dtype(w_work, s_val, dtype=self.dtype)
+                    w_work = promoted[0]
+                    if s_val is not None:
+                        s_val = promoted[1]
+
+                f_axes = _normalize_axes(self.feature_axes, w_work.ndim)
+                red_axes = tuple(i for i in range(w_work.ndim) if i not in f_axes)
+                norm = jnp.sqrt(
+                    jnp.sum(w_work * w_work, axis=red_axes, keepdims=True) + self.epsilon
+                )
+                normed_w = w_work / norm
+                if s_val is not None:
+                    if w_work.ndim > 1:
+                        bcast_shape = [1] * w_work.ndim
                         for ax in f_axes:
-                            bcast_shape[ax] = orig_w.shape[ax]
+                            bcast_shape[ax] = w_work.shape[ax]
                         s_b = jnp.reshape(s_val, tuple(bcast_shape))
                     else:
                         s_b = s_val

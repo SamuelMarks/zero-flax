@@ -25,6 +25,7 @@ from zero_flax.types import (
     JaxArray,
     MetadataValue,
     ensure_array,
+    sanitize_dtype_str,
 )
 
 InitArgValue: TypeAlias = Union[
@@ -135,6 +136,8 @@ ModuleTarget: TypeAlias = Union[
 ]
 WrappedCallableType: TypeAlias = Union[
     Module,
+    TwoIntModuleClassProtocol,
+    ZeroArgModuleFactoryProtocol,
     TransformTargetProtocol,
 ]
 
@@ -153,20 +156,8 @@ def _is_module_class(
     return isinstance(target, type)
 
 
-def _is_transform_callable(target: ModuleTarget) -> TypeGuard[TransformTargetProtocol]:
-    """Check whether ``target`` is a general callable transformation target.
-
-    Args:
-        target: Candidate transformation target.
-
-    Returns:
-        ``True`` if ``target`` is callable and not a ``Module`` instance or class.
-    """
-    return not isinstance(target, (Module, type))
-
-
 def _is_zero_arg_factory(
-    target: Union[TransformTargetProtocol, ZeroArgModuleFactoryProtocol],
+    target: Union[TwoIntModuleClassProtocol, TransformTargetProtocol, ZeroArgModuleFactoryProtocol],
 ) -> TypeGuard[ZeroArgModuleFactoryProtocol]:
     """Check whether ``target`` is a zero-argument callable factory.
 
@@ -177,6 +168,20 @@ def _is_zero_arg_factory(
         ``True`` if ``target`` is a zero-argument callable.
     """
     return len(inspect.signature(target).parameters) == 0
+
+
+def _is_general_transform_callable(
+    target: Union[TwoIntModuleClassProtocol, TransformTargetProtocol, ZeroArgModuleFactoryProtocol],
+) -> TypeGuard[TransformTargetProtocol]:
+    """Narrow ``target`` to ``TransformTargetProtocol``.
+
+    Args:
+        target: Candidate transformation target.
+
+    Returns:
+        ``True`` if ``target`` is callable.
+    """
+    return callable(target)
 
 
 def _count_required_positional_params(
@@ -221,6 +226,10 @@ def _instantiate_target(
 
     Returns:
         Instantiated ``Module`` or callable function.
+
+    Raises:
+        TypeError: If ``target`` is a ``Module`` class requiring positional initialization
+            arguments that were not provided in ``init_args`` or ``init_kwargs``.
     """
     if isinstance(target, Module):
         return target
@@ -230,15 +239,21 @@ def _instantiate_target(
     if _is_module_class(target):
         if len(resolved_args) == 0 and len(resolved_kwargs) == 0:
             req_count, _ = _count_required_positional_params(target)
-            fallback_args: Tuple[InitArgValue, ...] = (1,) * max(1, req_count)
-            return target(*fallback_args)
+            if req_count > 0:
+                raise TypeError(
+                    f"Module class {target!r} requires {req_count} positional initialization "
+                    f"argument(s); pass module_init_args or module_init_kwargs, or pass an "
+                    f"already-instantiated Module."
+                )
+            return target()
         return target(*resolved_args, **resolved_kwargs)
 
-    assert _is_transform_callable(target)
     if _is_zero_arg_factory(target):
         return target()
 
-    if init_args is not None or init_kwargs is not None:
+    if (init_args is not None or init_kwargs is not None) and _is_general_transform_callable(
+        target
+    ):
         arr_args: Tuple[ArrayLike, ...] = tuple(
             a for a in resolved_args if isinstance(a, (int, float, bool))
         )
@@ -296,15 +311,59 @@ def _call_wrapped(
 
     Returns:
         ``JaxArray`` or tuple of ``JaxArray``s produced by ``instance(*args, **kwargs)``.
+
+    Raises:
+        TypeError: If ``instance`` is not callable or returns a ``Module`` instead of tensor output.
     """
-    if _is_callable_target(instance):
-        raw_res = instance(*args, **kwargs)
-        if isinstance(raw_res, tuple):
-            return tuple(ensure_array(item) for item in raw_res)
-        if isinstance(raw_res, Module):
-            return jnp.zeros((0,))
-        return ensure_array(raw_res)
-    return ensure_array(args[0]) if len(args) > 0 else jnp.zeros((0,))
+    if not _is_callable_target(instance):
+        raise TypeError(f"Wrapped transformation target {instance!r} is not callable.")
+    raw_res = instance(*args, **kwargs)
+    if isinstance(raw_res, tuple):
+        return tuple(ensure_array(item) for item in raw_res)
+    if isinstance(raw_res, Module):
+        raise TypeError(
+            f"Wrapped transformation target {instance!r} returned a Module instead of an ArrayLike."
+        )
+    return ensure_array(raw_res)
+
+
+def _stack_step_results(
+    step_results: Sequence[TransformOutput],
+    out_axes: Union[int, Sequence[Optional[int]], None],
+) -> TransformOutput:
+    """Stack a non-empty sequence of per-step ``TransformOutput`` results along ``out_axes``.
+
+    Args:
+        step_results: Sequence of per-step array or tuple-of-array outputs.
+        out_axes: Output axis specification (integer, ``None``, or sequence of optional ints).
+
+    Returns:
+        Stacked ``JaxArray`` or tuple of ``JaxArray``s.
+    """
+    first_res = step_results[0]
+    default_ax = out_axes if isinstance(out_axes, int) else 0
+    if isinstance(first_res, tuple):
+        tuple_steps = [s for s in step_results if isinstance(s, tuple)]
+        num_tuple_elems = len(first_res)
+        stacked_tuple: list[JaxArray] = []
+        for t_i in range(num_tuple_elems):
+            elem_axis = (
+                out_axes[t_i]
+                if isinstance(out_axes, Sequence) and t_i < len(out_axes)
+                else (None if out_axes is None else default_ax)
+            )
+            if elem_axis is None:
+                stacked_tuple.append(first_res[t_i])
+            else:
+                pieces = [jnp.expand_dims(step_r[t_i], axis=elem_axis) for step_r in tuple_steps]
+                stacked_tuple.append(jnp.concatenate(pieces, axis=elem_axis))
+        return tuple(stacked_tuple)
+
+    if out_axes is None:
+        return first_res
+    arr_steps = [s for s in step_results if not isinstance(s, tuple)]
+    slices_out = [jnp.expand_dims(step_r, axis=default_ax) for step_r in arr_steps]
+    return jnp.concatenate(slices_out, axis=default_ax)
 
 
 class Jit(Module):
@@ -533,20 +592,27 @@ class Vmap(Module):
 
         Returns:
             Stacked ``JaxArray`` (or tuple of stacked ``JaxArray``s) of vectorized outputs along ``out_axes``.
+
+        Raises:
+            ValueError: If mapped input arguments have inconsistent batch dimension sizes.
         """
         if len(args) == 0 and self.axis_size is None:
             return _call_wrapped(self.wrapped_module, **kwargs)
 
         arr_args = [ensure_array(a) for a in args]
         arg_axes = [self._resolve_arg_axis(i) for i in range(len(arr_args))]
-        out_ax = self.out_axes if isinstance(self.out_axes, int) else 0
 
         batch_len: Optional[int] = self.axis_size
-        if batch_len is None:
-            for arr_a, ax_a in zip(arr_args, arg_axes):
-                if ax_a is not None and arr_a.ndim > 0:
-                    batch_len = arr_a.shape[ax_a]
-                    break
+        for arr_a, ax_a in zip(arr_args, arg_axes):
+            if ax_a is not None and arr_a.ndim > 0:
+                norm_ax = ax_a if ax_a >= 0 else arr_a.ndim + ax_a
+                dim_sz = arr_a.shape[norm_ax]
+                if batch_len is None:
+                    batch_len = dim_sz
+                elif dim_sz != batch_len:
+                    raise ValueError(
+                        f"Vmap got inconsistent batch axis sizes: expected {batch_len}, got {dim_sz}."
+                    )
         if batch_len is None:
             return _call_wrapped(self.wrapped_module, *args, **kwargs)
 
@@ -560,29 +626,7 @@ class Vmap(Module):
                     step_args.append(arr_a)
             step_results.append(_call_wrapped(self.wrapped_module, *step_args, **kwargs))
 
-        first_res = step_results[0]
-        if isinstance(first_res, tuple):
-            num_tuple_elems = len(first_res)
-            stacked_tuple: list[JaxArray] = []
-            for t_i in range(num_tuple_elems):
-                elem_Axis = (
-                    self.out_axes[t_i]
-                    if isinstance(self.out_axes, Sequence) and t_i < len(self.out_axes)
-                    else out_ax
-                )
-                eff_ax = elem_Axis if elem_Axis is not None else 0
-                pieces: list[JaxArray] = []
-                for step_r in step_results:
-                    assert isinstance(step_r, tuple)
-                    pieces.append(jnp.expand_dims(step_r[t_i], axis=eff_ax))
-                stacked_tuple.append(jnp.concatenate(pieces, axis=eff_ax))
-            return tuple(stacked_tuple)
-
-        slices_out: list[JaxArray] = []
-        for step_r in step_results:
-            assert not isinstance(step_r, tuple)
-            slices_out.append(jnp.expand_dims(step_r, axis=out_ax))
-        return jnp.concatenate(slices_out, axis=out_ax)
+        return _stack_step_results(step_results, self.out_axes)
 
 
 class Scan(Module):
@@ -687,7 +731,7 @@ class Scan(Module):
         """Execute the scanned loop over ``*args``.
 
         Args:
-            *args: Either ``(carry, xs)`` or ``(xs,)`` depending on the wrapped module signature.
+            *args: Either ``(carry, *xs)`` or ``(xs,)`` depending on the wrapped module signature.
             **kwargs: Keyword arguments forwarded to each scan step.
 
         Returns:
@@ -698,8 +742,15 @@ class Scan(Module):
             return _call_wrapped(self.wrapped_module, **kwargs)
         if len(args) == 1:
             xs = ensure_array(args[0])
-            ax = self.in_axes if self.in_axes < xs.ndim else 0
+            if self.data_transform is not None:
+                dt_res = self.data_transform(xs)
+                if not isinstance(dt_res, (Module, tuple)):
+                    xs = ensure_array(dt_res)
+            norm_in_ax = self.in_axes if self.in_axes >= 0 else max(0, xs.ndim + self.in_axes)
+            ax = norm_in_ax if norm_in_ax < xs.ndim else 0
             seq_len = self.length if self.length is not None else xs.shape[ax]
+            if seq_len == 0:
+                return xs
             indices = list(range(seq_len - 1, -1, -1)) if self.reverse else list(range(seq_len))
             step_outs: list[JaxArray] = []
             for idx in indices:
@@ -710,12 +761,32 @@ class Scan(Module):
             return jnp.concatenate(step_outs, axis=ax)
 
         carry_idx = self.carry_argnum if 0 <= self.carry_argnum < len(args) else 0
-        xs_idx = 1 if carry_idx == 0 else 0
         carry = ensure_array(args[carry_idx])
-        xs = ensure_array(args[xs_idx])
-        ax = self.in_axes if self.in_axes < xs.ndim else 0
-        out_ax = self.out_axes if self.out_axes <= xs.ndim else 0
-        seq_len = self.length if self.length is not None else xs.shape[ax]
+        scanned_indices = [i for i in range(len(args)) if i != carry_idx]
+        scanned_arrays: list[JaxArray] = []
+        for s_i in scanned_indices:
+            arr_s = ensure_array(args[s_i])
+            if self.data_transform is not None:
+                dt_s = self.data_transform(arr_s)
+                if not isinstance(dt_s, (Module, tuple)):
+                    arr_s = ensure_array(dt_s)
+            scanned_arrays.append(arr_s)
+
+        first_xs = scanned_arrays[0]
+        norm_in_ax = self.in_axes if self.in_axes >= 0 else max(0, first_xs.ndim + self.in_axes)
+        ax = norm_in_ax if norm_in_ax < first_xs.ndim else 0
+        norm_out_ax = self.out_axes if self.out_axes >= 0 else max(0, first_xs.ndim + self.out_axes)
+        out_ax = norm_out_ax if norm_out_ax <= first_xs.ndim else 0
+        seq_len = self.length if self.length is not None else first_xs.shape[ax]
+        if seq_len == 0:
+            empty_shape = list(carry.shape)
+            empty_shape.insert(out_ax, 0)
+            c_dt = sanitize_dtype_str(str(carry.dtype).lower())
+            empty_out: JaxArray = jnp.zeros(tuple(empty_shape), dtype=c_dt)
+            if self.scan_output:
+                return carry, empty_out
+            return carry
+
         indices = list(range(seq_len - 1, -1, -1)) if self.reverse else list(range(seq_len))
         ys: list[JaxArray] = []
 
@@ -724,11 +795,13 @@ class Scan(Module):
             _, accepts_two = _count_required_positional_params(self.wrapped_module)
 
         for idx in indices:
-            step_x = _slice_along_axis(xs, ax, idx)
+            sliced_xs = [_slice_along_axis(arr_s, ax, idx) for arr_s in scanned_arrays]
+            step_x = sliced_xs[0]
             if _is_callable_target(self.wrapped_module):
                 if accepts_two:
-                    call_pair = (carry, step_x) if carry_idx == 0 else (step_x, carry)
-                    raw_out = self.wrapped_module(*call_pair, **kwargs)
+                    call_args: list[JaxArray] = list(sliced_xs)
+                    call_args.insert(carry_idx, carry)
+                    raw_out = self.wrapped_module(*call_args, **kwargs)
                 else:
                     raw_out = self.wrapped_module(step_x, **kwargs)
             else:
@@ -838,25 +911,31 @@ class Pmap(Module):
         Returns:
             Device-mapped output ``JaxArray`` or tuple of ``JaxArray``s.
         """
-        if len(args) == 0:
+        if len(args) == 0 and self.axis_size is None:
             return _call_wrapped(self.wrapped_module, **kwargs)
-        first = ensure_array(args[0])
-        if first.ndim == 0:
+
+        arr_args = [ensure_array(a) for a in args]
+        num_devices: Optional[int] = self.axis_size
+        if num_devices is None:
+            for arg_idx, arr_a in enumerate(arr_args):
+                if arg_idx not in self.static_broadcasted_argnums and arr_a.ndim > 0:
+                    norm_ax = self.in_axes if self.in_axes >= 0 else arr_a.ndim + self.in_axes
+                    num_devices = arr_a.shape[norm_ax]
+                    break
+        if num_devices is None:
             return _call_wrapped(self.wrapped_module, *args, **kwargs)
-        num_devices = first.shape[self.in_axes]
-        outputs: list[JaxArray] = []
+
+        step_results: list[TransformOutput] = []
         for idx in range(num_devices):
             step_args: list[ArrayLike] = []
-            for a in args:
-                arr_a = ensure_array(a)
-                if arr_a.ndim > 0:
+            for arg_idx, arr_a in enumerate(arr_args):
+                if arg_idx not in self.static_broadcasted_argnums and arr_a.ndim > 0:
                     step_args.append(_slice_along_axis(arr_a, self.in_axes, idx))
                 else:
                     step_args.append(arr_a)
-            step_res = _call_wrapped(self.wrapped_module, *step_args, **kwargs)
-            step_y = step_res[0] if isinstance(step_res, tuple) else step_res
-            outputs.append(jnp.expand_dims(step_y, axis=self.out_axes))
-        return jnp.concatenate(outputs, axis=self.out_axes)
+            step_results.append(_call_wrapped(self.wrapped_module, *step_args, **kwargs))
+
+        return _stack_step_results(step_results, self.out_axes)
 
 
 __all__ = [

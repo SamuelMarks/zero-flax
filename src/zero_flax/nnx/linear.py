@@ -11,6 +11,7 @@ from collections.abc import Mapping, Sequence
 from types import MappingProxyType
 from typing import Optional, Tuple, Union
 
+from zero_jax import lax
 from zero_jax import numpy as jnp
 
 from zero_flax.nnx.module import Module
@@ -39,24 +40,48 @@ from zero_flax.types import (
 )
 
 
+def _assert_axis_dimension(tensor: JaxArray, axis: int, expected: int) -> None:
+    """Validate that ``tensor`` has size ``expected`` along ``axis`` via ``zero_chex``.
+
+    Args:
+        tensor: Input ``JaxArray`` to validate.
+        axis: Axis index to check.
+        expected: Expected dimension size along ``axis``.
+    """
+    from zero_chex.assertions import assert_axis_dimension
+
+    assert_axis_dimension(tensor, axis, expected)
+
+
 def _normalize_einsum_equation(einsum_str: str) -> str:
     """Normalize an Einstein summation equation, inferring output subscripts if omitted.
+
+    Supports both standard subscript equations (e.g., ``"ab,bc"`` -> ``"ab,bc->ac"``)
+    and ellipsis broadcasting equations (e.g., ``"...ab,bc"`` -> ``"...ab,bc->...ac"``).
 
     Args:
         einsum_str: Raw Einstein summation string (e.g., ``"ab,bc->ac"`` or ``"ab,bc"``).
 
     Returns:
         Normalized equation string containing explicit ``"->"`` output subscripts.
+
+    Raises:
+        ValueError: If ``einsum_str`` is empty or lacks a comma separating operands.
     """
     cleaned = einsum_str.replace(" ", "")
     if "->" in cleaned:
         return cleaned
+    if "," not in cleaned:
+        raise ValueError(f"Invalid einsum equation {einsum_str!r}: missing ',' between operands.")
+    has_ellipsis = "..." in cleaned
+    without_ellipsis = cleaned.replace("...", "")
     counts: dict[str, int] = {}
-    for ch in cleaned:
+    for ch in without_ellipsis:
         if ch.isalpha():
             counts[ch] = counts.get(ch, 0) + 1
     out_chars = "".join(sorted(ch for ch, cnt in counts.items() if cnt == 1))
-    return f"{cleaned}->{out_chars}"
+    prefix = "..." if has_ellipsis else ""
+    return f"{cleaned}->{prefix}{out_chars}"
 
 
 class Linear(Module):
@@ -179,10 +204,18 @@ class Linear(Module):
                 f"Linear input last dimension ({x.shape[-1] if x.ndim > 0 else 'scalar'}) "
                 f"does not match in_features ({self.in_features})."
             )
-        k = ensure_array(self.kernel.value)
+        _assert_axis_dimension(x, -1, self.in_features)
+        k = ensure_array(self.kernel.value, dtype=self.dtype)
+        b_raw: Optional[JaxArray] = (
+            ensure_array(self.bias.value, dtype=self.dtype)
+            if (self.use_bias and self.bias is not None)
+            else None
+        )
         if self.promote_dtype is not None:
-            promoted = self.promote_dtype(x, k, dtype=self.dtype)
+            promoted = self.promote_dtype(x, k, b_raw, dtype=self.dtype)
             x, k = promoted[0], promoted[1]
+            if b_raw is not None:
+                b_raw = promoted[2]
         if self.dot_general is not None:
             last_axis = x.ndim - 1
             out: JaxArray = self.dot_general(
@@ -194,8 +227,8 @@ class Linear(Module):
             )
         else:
             out = jnp.dot(x, k)
-        if self.use_bias and self.bias is not None:
-            out = out + ensure_array(self.bias.value, dtype=self.dtype)
+        if b_raw is not None:
+            out = out + b_raw
         if self.preferred_element_type is not None:
             out = ensure_array(out, dtype=self.preferred_element_type)
         return out
@@ -322,7 +355,7 @@ class LinearGeneral(Module):
             in_features: Input feature dimension size or sequence of sizes.
             out_features: Output feature dimension size or sequence of sizes.
             axis: Input axis or sequence of axes along which to contract.
-            batch_axis: Optional mapping or sequence of batch dimension indices.
+            batch_axis: Optional mapping (input_axis -> batch_dim_size_or_rhs_axis) or sequence of batch dimension sizes/axes.
             use_bias: Whether to include a learnable bias tensor.
             dtype: Computation data type.
             param_dtype: Parameter initialization data type.
@@ -367,7 +400,8 @@ class LinearGeneral(Module):
         k_fn = resolve_initializer(kernel_init, default_kernel_init)
         k_key = resolve_rng_key(rngs, "params", fold_index=0)
         k_meta = dict(kernel_metadata) if kernel_metadata is not None else {}
-        kernel_shape = self.in_features + self.out_features
+        batch_dims_prefix = (1,) * len(self.batch_axis)
+        kernel_shape = batch_dims_prefix + self.in_features + self.out_features
         self.kernel = self.register_variable(
             "kernel",
             Param(k_fn(k_key, kernel_shape, param_dtype), **k_meta),
@@ -377,9 +411,10 @@ class LinearGeneral(Module):
             b_fn = resolve_initializer(bias_init, default_bias_init)
             b_key = resolve_rng_key(rngs, "params", fold_index=1)
             b_meta = dict(bias_metadata) if bias_metadata is not None else {}
+            bias_shape = batch_dims_prefix + self.out_features
             self.bias = self.register_variable(
                 "bias",
-                Param(b_fn(b_key, self.out_features, param_dtype), **b_meta),
+                Param(b_fn(b_key, bias_shape, param_dtype), **b_meta),
             )
         else:
             self.bias = None
@@ -398,14 +433,30 @@ class LinearGeneral(Module):
             ValueError: If contracted input dimensions do not match ``self.in_features``.
         """
         x = ensure_array(inputs)
-        k = ensure_array(self.kernel.value)
+        k = ensure_array(self.kernel.value, dtype=self.dtype)
+        b_raw: Optional[JaxArray] = (
+            ensure_array(self.bias.value, dtype=self.dtype)
+            if (self.use_bias and self.bias is not None)
+            else None
+        )
         if self.promote_dtype is not None:
-            promoted = self.promote_dtype(x, k, dtype=self.dtype)
+            promoted = self.promote_dtype(x, k, b_raw, dtype=self.dtype)
             x, k = promoted[0], promoted[1]
+            if b_raw is not None:
+                b_raw = promoted[2]
+
         ndim = x.ndim
         norm_axes = tuple(a if a >= 0 else ndim + a for a in self.axis)
         lhs_batch_axes = tuple(a if a >= 0 else ndim + a for a in self.batch_axis)
         rhs_batch_axes = tuple(b if b >= 0 else k.ndim + b for b in self.batch_axis.values())
+        if len(rhs_batch_axes) > 0:
+            expanded_k = k
+            for lhs_ax, rhs_ax in zip(lhs_batch_axes, rhs_batch_axes):
+                if expanded_k.shape[rhs_ax] == 1 and x.shape[lhs_ax] > 1:
+                    expanded_k = jnp.concatenate(
+                        [expanded_k for _ in range(x.shape[lhs_ax])], axis=rhs_ax
+                    )
+            k = expanded_k
         kernel_contract_axes = tuple(
             i for i in range(len(rhs_batch_axes) + len(self.in_features)) if i not in rhs_batch_axes
         )
@@ -435,10 +486,14 @@ class LinearGeneral(Module):
         else:
             out = jnp.tensordot(x, k, axes=(norm_axes, kernel_contract_axes))
 
-        if self.use_bias and self.bias is not None:
-            b_arr = ensure_array(self.bias.value, dtype=self.dtype)
+        if b_raw is not None:
+            b_arr = b_raw
             if b_arr.ndim < out.ndim:
-                bcast_shape = (1,) * (out.ndim - b_arr.ndim) + b_arr.shape
+                bcast_shape = (
+                    b_arr.shape[: len(rhs_batch_axes)]
+                    + (1,) * (out.ndim - b_arr.ndim)
+                    + b_arr.shape[len(rhs_batch_axes) :]
+                )
                 b_arr = jnp.reshape(b_arr, bcast_shape)
             out = out + b_arr
         if self.preferred_element_type is not None:
@@ -546,17 +601,25 @@ class Einsum(Module):
         Returns:
             Resulting ``JaxArray`` (plus ``self.bias`` if configured).
         """
-        x = ensure_array(inputs)
-        k = ensure_array(self.kernel.value)
+        x = ensure_array(inputs, dtype=self.dtype)
+        k = ensure_array(self.kernel.value, dtype=self.dtype)
+        b_raw: Optional[JaxArray] = (
+            ensure_array(self.bias.value, dtype=self.dtype) if self.bias is not None else None
+        )
         if self.promote_dtype is not None:
-            promoted = self.promote_dtype(x, k, dtype=self.dtype)
+            promoted = self.promote_dtype(x, k, b_raw, dtype=self.dtype)
             x, k = promoted[0], promoted[1]
+            if b_raw is not None:
+                b_raw = promoted[2]
         if self.einsum_op is not None:
             out: JaxArray = self.einsum_op(self.einsum_str, x, k)
         else:
             out = jnp.einsum(self.einsum_str, x, k)
-        if self.bias is not None:
-            out = out + ensure_array(self.bias.value, dtype=self.dtype)
+        if b_raw is not None:
+            b_arr = b_raw
+            if b_arr.ndim < out.ndim:
+                b_arr = jnp.reshape(b_arr, (1,) * (out.ndim - b_arr.ndim) + b_arr.shape)
+            out = out + b_arr
         if self.preferred_element_type is not None:
             out = ensure_array(out, dtype=self.preferred_element_type)
         return out
@@ -665,15 +728,39 @@ class LoRA(Module):
 
         Returns:
             Output ``JaxArray`` with last dimension ``out_features``.
+
+        Raises:
+            ValueError: If the last dimension of ``x`` does not match ``self.in_features``.
         """
         arr = ensure_array(x)
+        if arr.ndim == 0 or arr.shape[-1] != self.in_features:
+            raise ValueError(
+                f"LoRA input last dimension ({arr.shape[-1] if arr.ndim > 0 else 'scalar'}) "
+                f"does not match in_features ({self.in_features})."
+            )
+        _assert_axis_dimension(arr, -1, self.in_features)
         a_val = ensure_array(self.lora_a.value)
         b_val = ensure_array(self.lora_b.value)
         if self.promote_dtype is not None:
             promoted = self.promote_dtype(arr, a_val, b_val, dtype=self.dtype)
             arr, a_val, b_val = promoted[0], promoted[1], promoted[2]
-        hidden: JaxArray = jnp.dot(arr, a_val)
-        lora_out: JaxArray = jnp.dot(hidden, b_val)
+        if self.precision is not None:
+            last_ax = max(0, arr.ndim - 1)
+            hidden: JaxArray = lax.dot_general(
+                arr,
+                a_val,
+                dimension_numbers=(((last_ax,), (0,)), ((), ())),
+                precision=self.precision,
+            )
+            lora_out: JaxArray = lax.dot_general(
+                hidden,
+                b_val,
+                dimension_numbers=(((max(0, hidden.ndim - 1),), (0,)), ((), ())),
+                precision=self.precision,
+            )
+        else:
+            hidden = jnp.dot(arr, a_val)
+            lora_out = jnp.dot(hidden, b_val)
         if self.base_module is not None and callable(self.base_module):
             base_out: JaxArray = ensure_array(self.base_module(arr))
             return base_out + lora_out
@@ -749,6 +836,7 @@ class LoRALinear(Linear):
             bias_metadata: Metadata mapping for ``bias``.
             **kwargs: Additional configuration metadata entries.
         """
+        eff_rngs: Union[Rngs, RngStream] = rngs if rngs is not None else Rngs(0)
         super().__init__(
             in_features=in_features,
             out_features=out_features,
@@ -761,7 +849,7 @@ class LoRALinear(Linear):
             dot_general=dot_general,
             promote_dtype=promote_dtype,
             preferred_element_type=preferred_element_type,
-            rngs=rngs,
+            rngs=eff_rngs,
             kernel_metadata=kernel_metadata,
             bias_metadata=bias_metadata,
         )
@@ -785,7 +873,7 @@ class LoRALinear(Linear):
                 b_initializer=b_initializer,
                 lora_param_type=lora_param_type,
                 promote_dtype=lora_promote_dtype,
-                rngs=rngs,
+                rngs=eff_rngs,
                 a_metadata=a_metadata,
                 b_metadata=b_metadata,
             ),

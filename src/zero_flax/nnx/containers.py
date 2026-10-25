@@ -8,12 +8,21 @@ parent module registries without dynamic reflection or `Any`.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Iterator, Mapping
-from typing import Generic, Optional, Protocol, Tuple, TypeVar, Union, runtime_checkable
+from typing import (
+    Generic,
+    Optional,
+    Protocol,
+    SupportsIndex,
+    Tuple,
+    TypeVar,
+    Union,
+    runtime_checkable,
+)
 
 from typing_extensions import TypeAlias, TypeGuard
 
 from zero_flax.nnx.module import Module
-from zero_flax.nnx.variables import Variable, VariableValue
+from zero_flax.nnx.variables import AnyVariable, Variable, VariableBase
 from zero_flax.types import ArrayLike, JaxArray
 
 
@@ -41,7 +50,8 @@ class LayerCallableProtocol(Protocol):
 
 ContainerItem: TypeAlias = Union[
     Module,
-    Variable[VariableValue],
+    VariableBase,
+    AnyVariable,
     LayerCallableProtocol,
     JaxArray,
     ArrayLike,
@@ -75,6 +85,7 @@ class Dict(Module, Generic[ItemT]):
             **kwargs: Additional key-value entries to store in the container.
         """
         super().__init__()
+        self._allows_dynamic_variables = True
         self._data = {}
         for arg in args:
             if isinstance(arg, Mapping):
@@ -88,18 +99,21 @@ class Dict(Module, Generic[ItemT]):
         self.finish_init()
 
     def __setitem__(self, key: str, value: ItemT) -> None:
-        """Store ``value`` under ``key`` and register it if it is a ``Module`` or ``Variable``.
+        """Store ``value`` under ``key`` and synchronize child/variable registries.
 
         Args:
             key: String dictionary key.
             value: Item to store.
         """
         self._ensure_registries()
-        self._data[key] = value
+        str_key = str(key)
+        self._children.pop(str_key, None)
+        self._variables.pop(str_key, None)
+        self._data[str_key] = value
         if isinstance(value, Module):
-            self.register_child(str(key), value)
+            self.register_child(str_key, value)
         elif isinstance(value, Variable):
-            self.register_variable(str(key), value)
+            self.register_variable(str_key, value)
 
     def __getitem__(self, key: str) -> ItemT:
         """Retrieve the item stored under ``key``.
@@ -110,7 +124,79 @@ class Dict(Module, Generic[ItemT]):
         Returns:
             Stored item.
         """
-        return self._data[key]
+        return self._data[str(key)]
+
+    def __delitem__(self, key: str) -> None:
+        """Delete ``key`` from the container and remove it from child/variable registries.
+
+        Args:
+            key: String dictionary key to delete.
+        """
+        str_key = str(key)
+        del self._data[str_key]
+        self._children.pop(str_key, None)
+        self._variables.pop(str_key, None)
+
+    def get(self, key: str, default: Optional[ItemT] = None) -> Optional[ItemT]:
+        """Return the item for ``key`` if present, else ``default``.
+
+        Args:
+            key: String dictionary key.
+            default: Fallback value if ``key`` is absent.
+
+        Returns:
+            Stored item or ``default``.
+        """
+        if key in self._data:
+            return self[key]
+        return default
+
+    def pop(self, key: str, default: Optional[ItemT] = None) -> Optional[ItemT]:
+        """Remove ``key`` and return its value, or ``default`` if absent.
+
+        Args:
+            key: String dictionary key to pop.
+            default: Fallback value if ``key`` is absent.
+
+        Returns:
+            Removed item or ``default``.
+        """
+        str_key = str(key)
+        if str_key in self._data:
+            val = self[str_key]
+            del self[str_key]
+            return val
+        return default
+
+    def clear(self) -> None:
+        """Remove all items from the Dict container and clear child/variable registries."""
+        self._data.clear()
+        self._children.clear()
+        self._variables.clear()
+
+    def keys(self) -> list[str]:
+        """Return a list of keys in the Dict container.
+
+        Returns:
+            List of string keys.
+        """
+        return list(self._data.keys())
+
+    def values(self) -> list[ItemT]:
+        """Return a list of values in the Dict container.
+
+        Returns:
+            List of stored items.
+        """
+        return [self[k] for k in self._data]
+
+    def items(self) -> list[Tuple[str, ItemT]]:
+        """Return a list of ``(key, value)`` pairs in the Dict container.
+
+        Returns:
+            List of ``(key, value)`` tuples.
+        """
+        return [(k, self[k]) for k in self._data]
 
     def __contains__(self, key: str) -> bool:
         """Check whether ``key`` is present in the Dict container.
@@ -164,35 +250,33 @@ class List(Module, list[ItemT], Generic[ItemT]):
         """
         Module.__init__(self)
         list.__init__(self)
+        self._allows_dynamic_variables = True
         self._pytree__has_int_keys = bool(_pytree__has_int_keys)
         if it is not None:
             for item in it:
                 self.append(item)
         self.finish_init()
 
-    def _register_indexed_item(self, index: int, value: ItemT) -> None:
-        """Register ``value`` under its stringified integer index if it is a ``Module`` or ``Variable``.
-
-        Args:
-            index: Non-negative integer element index.
-            value: Element value.
-        """
+    def _rebuild_registries(self) -> None:
+        """Rebuild ``_children`` and ``_variables`` from the current list contents in index order."""
         self._ensure_registries()
-        key = str(index)
-        if isinstance(value, Module):
-            self.register_child(key, value)
-        elif isinstance(value, Variable):
-            self.register_variable(key, value)
+        self._children.clear()
+        self._variables.clear()
+        for idx, item in enumerate(list.__iter__(self)):
+            key = str(idx)
+            if isinstance(item, Module):
+                self.register_child(key, item)
+            elif isinstance(item, Variable):
+                self.register_variable(key, item)
 
     def append(self, value: ItemT) -> None:
-        """Append ``value`` to the end of the list and register it in module state.
+        """Append ``value`` to the end of the list and synchronize module state.
 
         Args:
             value: Element to append.
         """
-        idx = len(self)
         super().append(value)
-        self._register_indexed_item(idx, value)
+        self._rebuild_registries()
 
     def extend(self, values: Iterable[ItemT]) -> None:
         """Extend the list by appending all elements from ``values``.
@@ -200,8 +284,55 @@ class List(Module, list[ItemT], Generic[ItemT]):
         Args:
             values: Iterable of elements to append.
         """
-        for val in values:
-            self.append(val)
+        super().extend(values)
+        self._rebuild_registries()
+
+    def insert(self, index: SupportsIndex, value: ItemT) -> None:
+        """Insert ``value`` before ``index`` and re-index registered children and variables.
+
+        Args:
+            index: Insertion position index.
+            value: Element to insert.
+        """
+        super().insert(index, value)
+        self._rebuild_registries()
+
+    def pop(self, index: SupportsIndex = -1) -> ItemT:
+        """Remove and return item at ``index`` and re-index registered children and variables.
+
+        Args:
+            index: Index of element to remove. Defaults to ``-1``.
+
+        Returns:
+            Removed element.
+        """
+        removed = super().pop(index)
+        self._rebuild_registries()
+        return removed
+
+    def clear(self) -> None:
+        """Remove all elements from the list and clear child/variable registries."""
+        super().clear()
+        self._rebuild_registries()
+
+    def set_at(self, index: int, value: ItemT) -> None:
+        """Replace the element at ``index`` with ``value`` and synchronize registries.
+
+        Args:
+            index: Element index to replace.
+            value: New element value.
+        """
+        list.__setitem__(self, index, value)
+        self._rebuild_registries()
+
+    def delete_at(self, index: int) -> None:
+        """Delete the element at ``index`` and re-index registries.
+
+        Args:
+            index: Element index to delete.
+        """
+        list.__delitem__(self, index)
+        self._rebuild_registries()
 
 
 SequentialLayer: TypeAlias = Union[
@@ -214,13 +345,13 @@ SequentialLayer: TypeAlias = Union[
 
 
 def _as_layer_callable(fn: SequentialLayer) -> TypeGuard[LayerCallableProtocol]:
-    """Narrow a ``SequentialLayer`` to ``LayerCallableProtocol``.
+    """Narrow a ``SequentialLayer`` to ``LayerCallableProtocol`` if callable.
 
     Args:
         fn: Candidate sequential layer or callable.
 
     Returns:
-        Always ``True`` for valid sequential layers.
+        ``True`` if ``fn`` is callable, otherwise ``False``.
     """
     return callable(fn)
 
@@ -265,11 +396,15 @@ class Sequential(Module):
 
         Returns:
             Final output produced by the last layer in the sequence.
+
+        Raises:
+            TypeError: If any layer in ``self.layers`` is not callable.
         """
         cur: ArrayLike = x
         for fn in self.layers:
-            if _as_layer_callable(fn):
-                cur = fn(cur, *args, **kwargs) if (args or kwargs) else fn(cur)
+            if not _as_layer_callable(fn):
+                raise TypeError(f"Sequential layer {fn!r} is not callable.")
+            cur = fn(cur, *args, **kwargs) if (args or kwargs) else fn(cur)
         return cur
 
 

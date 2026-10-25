@@ -15,12 +15,12 @@ from typing import Generic, Optional, Tuple, TypeVar, Union, overload
 from zero_flax.nnx.filterlib import FilterLiteral
 from zero_flax.nnx.state import State, StateEntry
 from zero_flax.nnx.state import merge as state_merge
-from zero_flax.nnx.variables import Variable, VariableValue
+from zero_flax.nnx.variables import AnyVariable, Variable
 from zero_flax.types import MetadataValue
 
 M = TypeVar("M", bound="Module")
 ChildT = TypeVar("ChildT", bound="Module")
-VarT = TypeVar("VarT", bound=Variable[VariableValue])
+VarT = TypeVar("VarT", bound=AnyVariable)
 
 
 class Module:
@@ -35,12 +35,15 @@ class Module:
         _variables: Dictionary mapping variable names to ``Variable`` instances.
         _static_config: Dictionary mapping static configuration keys to metadata values.
         _is_initializing: Boolean flag indicating whether ``__init__`` is in progress.
+        _allows_dynamic_variables: Boolean flag indicating whether ``update()`` may insert
+            new variable keys (enabled on dynamic containers such as ``Dict`` and ``List``).
     """
 
     _children: dict[str, Module]
-    _variables: dict[str, Variable[VariableValue]]
+    _variables: dict[str, AnyVariable]
     _static_config: dict[str, MetadataValue]
     _is_initializing: bool
+    _allows_dynamic_variables: bool
 
     def __init__(self, **_kwargs: MetadataValue) -> None:
         """Initialize the base Module registries.
@@ -52,6 +55,7 @@ class Module:
         self._variables = {}
         self._static_config = dict(_kwargs)
         self._is_initializing = True
+        self._allows_dynamic_variables = False
 
     def _ensure_registries(self) -> None:
         """Ensure internal registries exist even if ``super().__init__()`` was not called first."""
@@ -62,6 +66,7 @@ class Module:
             self._variables = {}
             self._static_config = {}
             self._is_initializing = False
+            self._allows_dynamic_variables = False
 
     def register_variable(self, name: str, variable: VarT) -> VarT:
         """Register a stateful ``Variable`` (such as ``Param`` or ``BatchStat``) under ``name``.
@@ -106,6 +111,18 @@ class Module:
         self._ensure_registries()
         self._is_initializing = False
 
+    def is_initializing(self) -> bool:
+        """Return whether this module is still executing ``__init__``.
+
+        Returns:
+            ``True`` before ``finish_init()`` is called, ``False`` afterward.
+        """
+        self._ensure_registries()
+        return self._is_initializing
+
+    def _on_state_updated(self) -> None:
+        """Synchronize container-specific storage after ``update()`` mutates registries."""
+
     def state(self) -> State:
         """Extract the hierarchical ``State`` of this module and all child modules.
 
@@ -134,7 +151,8 @@ class Module:
             **kw_states: Additional key-value state entries to apply.
 
         Raises:
-            KeyError: If a nested ``State`` key does not correspond to a registered child ``Module``.
+            KeyError: If a nested ``State`` key does not correspond to a registered child ``Module``,
+                or if a variable/static key is unknown on a fixed-schema ``Module``.
         """
         self._ensure_registries()
         combined = State()
@@ -145,7 +163,18 @@ class Module:
         for extra in more_states:
             combined = state_merge(combined, extra)
         if kw_states:
-            combined = state_merge(combined, State(kw_states))
+            strict_flag = kw_states.pop("strict_shapes", False)
+            if kw_states:
+                combined = state_merge(combined, State(kw_states))
+            if strict_flag is True:
+                from zero_chex import assert_trees_all_equal_shapes
+
+                from zero_flax.nnx.state import _state_to_chex_pytree
+
+                assert_trees_all_equal_shapes(
+                    _state_to_chex_pytree(self.state()),
+                    _state_to_chex_pytree(combined),
+                )
 
         for key, val in combined.items():
             if isinstance(val, State):
@@ -156,15 +185,27 @@ class Module:
                 if key in self._variables:
                     self._variables[key].value = val.value
                     self._variables[key].metadata = dict(val.metadata)
-                else:
+                elif self._allows_dynamic_variables:
                     self._variables[key] = val.copy()
+                else:
+                    raise KeyError(
+                        f"Unknown variable key {key!r} in State update for {type(self).__name__}."
+                    )
             else:
                 if key in self._variables:
                     self._variables[key].value = val
+                elif key in self._static_config or self._allows_dynamic_variables:
+                    if isinstance(val, (str, int, float, bool, tuple)) or val is None:
+                        self._static_config[key] = val
+                    else:
+                        raise KeyError(
+                            f"Unsupported static config value for key {key!r} in {type(self).__name__}."
+                        )
                 else:
-                    self._static_config[key] = (
-                        val if isinstance(val, (str, int, float, bool, tuple)) else None
+                    raise KeyError(
+                        f"Unknown state key {key!r} in State update for {type(self).__name__}."
                     )
+        self._on_state_updated()
 
     def _clone_blueprint(self: M) -> M:
         """Create an independent deep clone of this module preserving registry identity links.
@@ -189,12 +230,14 @@ class GraphDef(Generic[M]):
         cls: Concrete ``Module`` class represented by this graph definition.
         children_defs: Dictionary mapping child names to their ``GraphDef`` definitions.
         static_fields: Dictionary of static configuration fields.
+        variable_keys: Tuple of variable keys expected directly on this module node.
         _blueprint: Cloned blueprint instance used for deterministic reconstruction.
     """
 
     cls: type[M]
     children_defs: dict[str, GraphDef[Module]]
     static_fields: dict[str, MetadataValue]
+    variable_keys: Tuple[str, ...]
     _blueprint: M
 
     def __init__(
@@ -203,6 +246,7 @@ class GraphDef(Generic[M]):
         children_defs: dict[str, GraphDef[Module]],
         static_fields: dict[str, MetadataValue],
         blueprint: M,
+        variable_keys: Tuple[str, ...] = (),
     ) -> None:
         """Initialize a GraphDef instance.
 
@@ -211,11 +255,25 @@ class GraphDef(Generic[M]):
             children_defs: Mapping of child module names to their ``GraphDef`` instances.
             static_fields: Static configuration fields of the module.
             blueprint: Cloned module blueprint used during ``merge``.
+            variable_keys: Optional tuple of direct variable names registered on this module.
         """
         self.cls = cls
         self.children_defs = dict(children_defs)
         self.static_fields = dict(static_fields)
+        self.variable_keys = (
+            tuple(variable_keys) if variable_keys else tuple(blueprint._variables.keys())
+        )
         self._blueprint = blueprint
+
+    def _apply_graphdef_metadata(self, target: Module) -> None:
+        """Recursively synchronize ``static_fields`` from ``self`` and ``children_defs`` onto ``target``.
+
+        Args:
+            target: Reconstructed ``Module`` instance.
+        """
+        target._static_config.update(self.static_fields)
+        for child_name, child_def in self.children_defs.items():
+            child_def._apply_graphdef_metadata(target._children[child_name])
 
     def merge(
         self,
@@ -232,6 +290,7 @@ class GraphDef(Generic[M]):
             Reconstructed ``Module`` instance of type ``M`` populated with ``state``.
         """
         reconstructed: M = self._blueprint._clone_blueprint()
+        self._apply_graphdef_metadata(reconstructed)
         if isinstance(state, State):
             combined = state_merge(state, *more_states)
         else:
@@ -319,6 +378,7 @@ def split(
         children_defs=children_defs,
         static_fields=dict(module._static_config),
         blueprint=blueprint,
+        variable_keys=tuple(module._variables.keys()),
     )
     full_state = module.state()
     if not filters:
@@ -427,7 +487,7 @@ def iter_graph(
     node: Union[Module, State],
     prefix: Tuple[str, ...] = (),
     visited: Optional[set[int]] = None,
-) -> Iterator[Tuple[Tuple[str, ...], Union[Module, Variable[VariableValue], State]]]:
+) -> Iterator[Tuple[Tuple[str, ...], Union[Module, AnyVariable, State]]]:
     """Iterate in depth-first order over all nodes (modules and variables) in ``node``.
 
     Args:
@@ -464,6 +524,7 @@ __all__ = [
     "GraphDef",
     "M",
     "Module",
+    "VarT",
     "iter_graph",
     "merge",
     "split",

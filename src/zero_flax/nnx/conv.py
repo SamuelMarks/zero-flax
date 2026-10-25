@@ -12,7 +12,6 @@ from collections.abc import Sequence
 from typing import Optional, Tuple, Union
 
 from zero_jax import numpy as jnp
-from zero_jax.nn import one_hot
 
 from zero_flax.nnx.module import Module
 from zero_flax.nnx.rnglib import Rngs, RngStream, resolve_rng_key
@@ -37,7 +36,21 @@ from zero_flax.types import (
     is_padding_pair_sequence,
     normalize_int_tuple,
     resolve_initializer,
+    sanitize_dtype_str,
 )
+
+
+def _assert_conv_rank_and_channels(x: JaxArray, expected_channels: int) -> None:
+    """Validate spatial rank and trailing channel dimension of ``x`` via ``zero_chex``.
+
+    Args:
+        x: Input ``JaxArray`` tensor.
+        expected_channels: Expected size of the last channel axis.
+    """
+    from zero_chex.assertions import assert_axis_dimension, assert_rank
+
+    assert_rank(x, x.ndim)
+    assert_axis_dimension(x, -1, expected_channels)
 
 
 def _compute_spatial_padding(
@@ -191,6 +204,7 @@ def _dilate_spatial_nd(
     if all(d <= 1 for d in dilations):
         return x
     cur = x
+    dt_str = sanitize_dtype_str(str(cur.dtype).lower())
     for s_i, d in enumerate(dilations):
         if d <= 1:
             continue
@@ -200,7 +214,7 @@ def _dilate_spatial_nd(
             continue
         zero_shape = list(cur.shape)
         zero_shape[axis] = d - 1
-        zero_block = jnp.zeros(tuple(zero_shape))
+        zero_block = jnp.zeros(tuple(zero_shape), dtype=dt_str)
         pieces: list[JaxArray] = []
         for idx in range(length):
             slices = [slice(None)] * cur.ndim
@@ -222,7 +236,7 @@ def _pad_spatial_nd(
     Args:
         x: Input array of shape ``(batch, *spatial, channels)``.
         spatial_pads: Sequence of ``(pad_before, pad_after)`` pairs for each spatial axis.
-        circular: If ``True``, wrap values from opposite spatial boundaries instead of zero-padding.
+        circular: If ``True``, wrap values modularly from opposite spatial boundaries instead of zero-padding.
 
     Returns:
         Padded ``JaxArray``.
@@ -230,31 +244,29 @@ def _pad_spatial_nd(
     if all(p0 == 0 and p1 == 0 for p0, p1 in spatial_pads):
         return x
     cur = x
+    dt_str = sanitize_dtype_str(str(cur.dtype).lower())
     for idx, (pad_before, pad_after) in enumerate(spatial_pads):
         axis = 1 + idx
         orig_axis_len = cur.shape[axis]
         if circular and orig_axis_len > 0:
-            take_pre = min(pad_before, orig_axis_len)
-            pre_slices = [slice(None)] * cur.ndim
-            pre_slices[axis] = slice(orig_axis_len - take_pre, orig_axis_len)
-            take_post = min(pad_after, orig_axis_len)
-            post_slices = [slice(None)] * cur.ndim
-            post_slices[axis] = slice(0, take_post)
-            cur = jnp.concatenate(
-                [cur[tuple(pre_slices)], cur, cur[tuple(post_slices)]],
-                axis=axis,
-            )
+            pieces: list[JaxArray] = []
+            for p_idx in range(-pad_before, orig_axis_len + pad_after):
+                wrap_idx = p_idx % orig_axis_len
+                slices = [slice(None)] * cur.ndim
+                slices[axis] = slice(wrap_idx, wrap_idx + 1)
+                pieces.append(cur[tuple(slices)])
+            cur = jnp.concatenate(pieces, axis=axis)
         else:
             shape_list = list(cur.shape)
             if pad_before > 0:
                 pre_shape = list(shape_list)
                 pre_shape[axis] = pad_before
-                cur = jnp.concatenate([jnp.zeros(tuple(pre_shape)), cur], axis=axis)
+                cur = jnp.concatenate([jnp.zeros(tuple(pre_shape), dtype=dt_str), cur], axis=axis)
                 shape_list = list(cur.shape)
             if pad_after > 0:
                 post_shape = list(shape_list)
                 post_shape[axis] = pad_after
-                cur = jnp.concatenate([cur, jnp.zeros(tuple(post_shape))], axis=axis)
+                cur = jnp.concatenate([cur, jnp.zeros(tuple(post_shape), dtype=dt_str)], axis=axis)
     return cur
 
 
@@ -423,13 +435,20 @@ class Conv(Module):
             ValueError: If ``inputs`` has fewer than ``len(kernel_size) + 1`` dimensions or
                 its channel dimension does not match ``self.in_features``.
         """
-        x = ensure_array(inputs)
-        k = ensure_array(self.kernel.value)
+        x = ensure_array(inputs, dtype=self.dtype)
+        k = ensure_array(self.kernel.value, dtype=self.dtype)
         if self.mask is not None:
             k = k * self.mask
+        b_raw: Optional[JaxArray] = (
+            ensure_array(self.bias.value, dtype=self.dtype)
+            if (self.use_bias and self.bias is not None)
+            else None
+        )
         if self.promote_dtype is not None:
-            promoted = self.promote_dtype(x, k, dtype=self.dtype)
+            promoted = self.promote_dtype(x, k, b_raw, dtype=self.dtype)
             x, k = promoted[0], promoted[1]
+            if b_raw is not None:
+                b_raw = promoted[2]
 
         num_spatial = len(self.kernel_size)
         if x.ndim < num_spatial + 1:
@@ -442,11 +461,12 @@ class Conv(Module):
                 f"Conv input channel dimension ({x.shape[-1]}) does not match "
                 f"in_features ({self.in_features})."
             )
+        _assert_conv_rank_and_channels(x, self.in_features)
 
         if self.conv_general_dilated is not None:
             custom_out = ensure_array(self.conv_general_dilated(x, k))
-            if self.use_bias and self.bias is not None:
-                custom_out = custom_out + ensure_array(self.bias.value, dtype=self.dtype)
+            if b_raw is not None:
+                custom_out = custom_out + b_raw
             return custom_out
 
         has_batch = x.ndim > num_spatial + 1
@@ -478,7 +498,11 @@ class Conv(Module):
             out_dim = max(1, (padded_spatial[idx] - eff_k) // self.strides[idx] + 1)
             out_spatial.append(out_dim)
 
-        acc: JaxArray = jnp.zeros((batch_size, *out_spatial, self.out_features))
+        comp_dt = sanitize_dtype_str(str(x.dtype).lower())
+        acc: JaxArray = jnp.zeros(
+            (batch_size, *out_spatial, self.out_features),
+            dtype=comp_dt,
+        )
         kernel_ranges = [range(ks) for ks in self.kernel_size]
         for k_idx in itertools.product(*kernel_ranges):
             slices = [slice(None)]
@@ -501,8 +525,8 @@ class Conv(Module):
                     parts.append(jnp.dot(w_g, k_g))
                 acc = acc + jnp.concatenate(parts, axis=-1)
 
-        if self.use_bias and self.bias is not None:
-            acc = acc + ensure_array(self.bias.value, dtype=self.dtype)
+        if b_raw is not None:
+            acc = acc + b_raw
 
         if self.preferred_element_type is not None:
             acc = ensure_array(acc, dtype=self.preferred_element_type)
@@ -653,13 +677,20 @@ class ConvTranspose(Module):
             ValueError: If ``inputs`` has fewer than ``len(kernel_size) + 1`` dimensions or
                 its channel dimension does not match ``self.in_features``.
         """
-        x = ensure_array(inputs)
-        k = ensure_array(self.kernel.value)
+        x = ensure_array(inputs, dtype=self.dtype)
+        k = ensure_array(self.kernel.value, dtype=self.dtype)
         if self.mask is not None:
             k = k * self.mask
+        b_raw: Optional[JaxArray] = (
+            ensure_array(self.bias.value, dtype=self.dtype)
+            if (self.use_bias and self.bias is not None)
+            else None
+        )
         if self.promote_dtype is not None:
-            promoted = self.promote_dtype(x, k, dtype=self.dtype)
+            promoted = self.promote_dtype(x, k, b_raw, dtype=self.dtype)
             x, k = promoted[0], promoted[1]
+            if b_raw is not None:
+                b_raw = promoted[2]
 
         num_spatial = len(self.kernel_size)
         if x.ndim < num_spatial + 1:
@@ -672,6 +703,7 @@ class ConvTranspose(Module):
                 f"ConvTranspose input channel dimension ({x.shape[-1]}) does not match "
                 f"in_features ({self.in_features})."
             )
+        _assert_conv_rank_and_channels(x, self.in_features)
 
         if self.transpose_kernel:
             flip_slices = tuple(slice(None, None, -1) for _ in range(num_spatial)) + (
@@ -711,7 +743,11 @@ class ConvTranspose(Module):
             out_dim = max(1, padded_spatial[idx] - eff_k + 1)
             out_spatial.append(out_dim)
 
-        acc: JaxArray = jnp.zeros((batch_size, *out_spatial, self.out_features))
+        comp_dt = sanitize_dtype_str(str(x.dtype).lower())
+        acc: JaxArray = jnp.zeros(
+            (batch_size, *out_spatial, self.out_features),
+            dtype=comp_dt,
+        )
         kernel_ranges = [range(ks) for ks in self.kernel_size]
         for k_idx in itertools.product(*kernel_ranges):
             slices = [slice(None)]
@@ -724,8 +760,8 @@ class ConvTranspose(Module):
             k_weight = k_eff[k_idx]
             acc = acc + jnp.dot(window, k_weight)
 
-        if self.use_bias and self.bias is not None:
-            acc = acc + ensure_array(self.bias.value, dtype=self.dtype)
+        if b_raw is not None:
+            acc = acc + b_raw
 
         if self.preferred_element_type is not None:
             acc = ensure_array(acc, dtype=self.preferred_element_type)
@@ -802,10 +838,11 @@ class Embed(Module):
         Returns:
             Embedded ``JaxArray`` of shape ``(*inputs.shape, features)``.
         """
-        idx = ensure_array(inputs)
+        idx = ensure_array(inputs, dtype="int32")
         table = ensure_array(self.embedding.value, dtype=self.dtype)
-        oh: JaxArray = ensure_array(one_hot(idx, self.num_embeddings), dtype=self.dtype)
-        res: JaxArray = jnp.dot(oh, table)
+        if self.promote_dtype is not None:
+            table = self.promote_dtype(table, dtype=self.dtype)[0]
+        res: JaxArray = table[idx]
         return res
 
     def attend(self, query: ArrayLike) -> JaxArray:

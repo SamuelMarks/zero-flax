@@ -56,14 +56,18 @@ jobs:
       working-directory: zero-flax
       run: |
         python -m pip install --upgrade pip
-        pip install ruff mypy interrogate build pytest pytest-cov pydantic
-        pip install "https://github.com/SamuelMarks/ml-ecosystem-snapshots/releases/download/v0.0.4/ml_ecosystem_snapshots-0.0.4-py3-none-any.whl"
-        pip install -e ../ml-switcheroo-ir
-        pip install -e ../ml-switcheroo-compiler
-        pip install -e ../zero-jax
-        pip install -e ../zero-chex
-        pip install -e ../zero-optax
         pip install -r requirements-test.txt
+        pip install --no-deps \
+          "git+https://github.com/SamuelMarks/griffe.git@rest#subdirectory=packages/griffelib" \
+          "git+https://github.com/SamuelMarks/griffe.git@rest#subdirectory=packages/griffecli" \
+          "git+https://github.com/SamuelMarks/griffe.git@rest"
+        pip install --no-deps "https://github.com/SamuelMarks/ml-ecosystem-snapshots/releases/download/v0.0.4/ml_ecosystem_snapshots-0.0.4-py3-none-any.whl"
+        pip install -e ../ml-switcheroo-ir
+        pip install libcst h5py pyyaml
+        pip install --no-deps -e ../ml-switcheroo-compiler
+        pip install --no-deps -e ../zero-jax
+        pip install --no-deps -e ../zero-chex
+        pip install --no-deps -e ../zero-optax
         pip install --no-deps -e .
 
     - name: Run Ruff Format & Lint

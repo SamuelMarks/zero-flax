@@ -44,6 +44,9 @@ from zero_flax.nnx import (
     MultiHeadAttention,
     MultiHeadDotProductAttention,
     OptimizedLSTMCell,
+    Optimizer,
+    OptState,
+    OptVariable,
     Param,
     Pmap,
     PReLU,
@@ -67,15 +70,39 @@ from zero_flax.nnx import (
     WeightNorm,
     iter_graph,
     merge,
+    restore_state,
+    save_state,
     split,
     update,
 )
 from zero_flax.nnx.module import state as state
-from zero_flax.nnx.variables import VariableValue
+from zero_flax.nnx.variables import AnyVariable, VariableBase, VariableValue
 
 K = TypeVar("K", bound=str)
 V = TypeVar("V")
-FrozenEntry: TypeAlias = Union[VariableValue, Variable[VariableValue], "FrozenDict"]
+FrozenEntry: TypeAlias = Union[
+    VariableValue,
+    VariableBase,
+    AnyVariable,
+    "FrozenDict",
+    Mapping[str, "FrozenEntry"],
+]
+
+
+def _freeze_entry(val: FrozenEntry) -> FrozenEntry:
+    """Recursively convert any mapping ``val`` into a ``FrozenDict``.
+
+    Args:
+        val: Candidate entry value.
+
+    Returns:
+        Frozen ``FrozenDict`` if ``val`` is a mapping, otherwise ``val`` unchanged.
+    """
+    if isinstance(val, FrozenDict):
+        return val
+    if isinstance(val, Mapping):
+        return FrozenDict(val)
+    return val
 
 
 class FrozenDict(Mapping[str, FrozenEntry]):
@@ -106,12 +133,12 @@ class FrozenDict(Mapping[str, FrozenEntry]):
         if mapping_or_iterable is not None:
             if isinstance(mapping_or_iterable, Mapping):
                 for k, v in mapping_or_iterable.items():
-                    raw[k] = FrozenDict(v) if isinstance(v, dict) else v
+                    raw[k] = _freeze_entry(v)
             else:
                 for k, v in mapping_or_iterable:
-                    raw[k] = FrozenDict(v) if isinstance(v, dict) else v
+                    raw[k] = _freeze_entry(v)
         for k, v in kwargs.items():
-            raw[k] = FrozenDict(v) if isinstance(v, dict) else v
+            raw[k] = _freeze_entry(v)
         self._data = raw
 
     def __getitem__(self, key: str) -> FrozenEntry:
@@ -141,6 +168,21 @@ class FrozenDict(Mapping[str, FrozenEntry]):
         """
         return len(self._data)
 
+    def __hash__(self) -> int:
+        """Compute a deterministic hash of the FrozenDict contents.
+
+        Returns:
+            Integer hash value.
+        """
+        items_hash: list[Tuple[str, int]] = []
+        for k in sorted(self._data.keys()):
+            v = self._data[k]
+            v_hash = (
+                hash(v) if isinstance(v, (int, float, str, bool, FrozenDict)) else hash(repr(v))
+            )
+            items_hash.append((k, v_hash))
+        return hash(tuple(items_hash))
+
     def copy(
         self,
         add_or_replace: Union[Mapping[str, FrozenEntry], None] = None,
@@ -156,7 +198,7 @@ class FrozenDict(Mapping[str, FrozenEntry]):
         merged = dict(self._data)
         if add_or_replace is not None:
             for k, v in add_or_replace.items():
-                merged[k] = FrozenDict(v) if isinstance(v, dict) else v
+                merged[k] = _freeze_entry(v)
         return FrozenDict(merged)
 
     def pop(self, key: str) -> Tuple[FrozenDict, FrozenEntry]:
@@ -217,7 +259,7 @@ def unfreeze(xs: Union[FrozenDict, Mapping[str, FrozenEntry]]) -> dict[str, Froz
     """
     if isinstance(xs, FrozenDict):
         return xs.unfreeze()
-    return {k: unfreeze(v) if isinstance(v, (FrozenDict, dict)) else v for k, v in xs.items()}
+    return {k: unfreeze(v) if isinstance(v, Mapping) else v for k, v in xs.items()}
 
 
 def copy(
@@ -266,7 +308,7 @@ def pretty_repr(xs: Union[FrozenDict, Mapping[str, FrozenEntry]], num_spaces: in
     indent = " " * max(0, int(num_spaces))
     lines: list[str] = ["{"]
     for k, v in xs.items():
-        if isinstance(v, (FrozenDict, dict)):
+        if isinstance(v, Mapping):
             sub = pretty_repr(v, num_spaces=num_spaces).replace(nl, f"{nl}{indent}")
             lines.append(f"{indent}{k}: {sub},")
         else:
@@ -306,7 +348,10 @@ __all__ = [
     "Module",
     "MultiHeadAttention",
     "MultiHeadDotProductAttention",
+    "OptState",
+    "OptVariable",
     "OptimizedLSTMCell",
+    "Optimizer",
     "PReLU",
     "Param",
     "Pmap",
@@ -335,6 +380,8 @@ __all__ = [
     "merge",
     "pop",
     "pretty_repr",
+    "restore_state",
+    "save_state",
     "split",
     "state",
     "unfreeze",

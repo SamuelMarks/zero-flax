@@ -9,7 +9,6 @@ without using `typing.Any`, `object`, `typing.cast`, or dynamic reflection.
 from __future__ import annotations
 
 import inspect
-import math
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from types import MappingProxyType
 from typing import Optional, Protocol, Tuple, Union, runtime_checkable
@@ -112,7 +111,16 @@ class Dtype:
         return self.name
 
 
-DType: TypeAlias = Union[Dtype, str, IrDType, CompilerDType, type[int], type[float], type[bool]]
+DType: TypeAlias = Union[
+    Dtype,
+    str,
+    IrDType,
+    CompilerDType,
+    type[int],
+    type[float],
+    type[bool],
+    type[str],
+]
 
 
 class Shape:
@@ -745,8 +753,10 @@ def sanitize_dtype_str(dtype: Optional[DType], default: str = "float32") -> str:
         return "int32"
     if dtype is float:
         return "float32"
-    if isinstance(dtype, str) and dtype in VALID_DTYPE_STRINGS:
-        return dtype
+    if isinstance(dtype, str):
+        cleaned_str = dtype.lower().removeprefix("dtype.")
+        if cleaned_str in VALID_DTYPE_STRINGS:
+            return cleaned_str
     raise ValueError(f"Unsupported dtype string: {dtype!r}")
 
 
@@ -770,6 +780,16 @@ def ensure_array(value: ArrayLike, dtype: Optional[DType] = None) -> JaxArray:
     return res_untyped
 
 
+_FLOAT_DTYPE_PRIORITY: dict[str, int] = {
+    "float16": 1,
+    "bfloat16": 2,
+    "float32": 3,
+    "float64": 4,
+    "complex64": 5,
+    "complex128": 6,
+}
+
+
 def default_promote_dtype(
     *args: Optional[ArrayLike],
     dtype: Optional[DType] = None,
@@ -788,17 +808,30 @@ def default_promote_dtype(
     resolved_dt: Optional[str] = sanitize_dtype_str(dtype) if dtype is not None else None
     converted: list[Optional[JaxArray]] = []
     needs_float = False
+    seen_float_dts: list[str] = []
     for item in args:
         if item is None:
             converted.append(None)
         else:
             arr = ensure_array(item, dtype=resolved_dt)
-            dt_str = str(arr.dtype).lower()
+            dt_str = sanitize_dtype_str(arr.dtype)
             if inexact and resolved_dt is None and ("int" in dt_str or "bool" in dt_str):
                 needs_float = True
+            elif dt_str in _FLOAT_DTYPE_PRIORITY:
+                seen_float_dts.append(dt_str)
             converted.append(arr)
 
-    target_dt = resolved_dt if resolved_dt is not None else ("float32" if needs_float else None)
+    target_dt: Optional[str] = resolved_dt
+    if target_dt is None:
+        if len(set(seen_float_dts)) > 1:
+            target_dt = max(seen_float_dts, key=lambda d: _FLOAT_DTYPE_PRIORITY.get(d, 3))
+        elif needs_float:
+            target_dt = (
+                max(seen_float_dts, key=lambda d: _FLOAT_DTYPE_PRIORITY.get(d, 3))
+                if seen_float_dts
+                else "float32"
+            )
+
     out: list[JaxArray] = []
     for arr_item in converted:
         if arr_item is None:
@@ -974,8 +1007,11 @@ def resolve_initializer(
         if sig_params == 2 and isinstance(init, TwoArgInitializerProtocol):
             out = init(key, tuple(shape))
         else:
-            assert isinstance(init, InitializerProtocol)
-            out = init(key, tuple(shape), clean_dt)
+            out = (
+                init(key, tuple(shape), clean_dt)
+                if isinstance(init, InitializerProtocol)
+                else fallback(key, tuple(shape), clean_dt)
+            )
         return ensure_array(out)
 
     return _wrapped
@@ -1157,7 +1193,6 @@ __all__ = [
     "is_padding_pair_sequence",
     "is_tensor",
     "lax",
-    "math",
     "normalize_int_tuple",
     "ones_init",
     "orthogonal_init",

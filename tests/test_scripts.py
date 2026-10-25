@@ -19,7 +19,7 @@ NL = chr(10)
 
 
 def test_lint_typing_script(tmp_path: Path) -> None:
-    """Verify lint_typing passes on clean code and catches Any, object, cast, reflection, and untyped defs.
+    """Verify lint_typing passes on clean code and catches Any, object, cast, assert, reflection, and untyped defs.
 
     Args:
         tmp_path: Temporary pytest directory fixture.
@@ -52,6 +52,7 @@ def test_lint_typing_script(tmp_path: Path) -> None:
         "from typing import Any, cast",
         "# type:" + " ignore",
         "def bad(x, *args, **kwargs):",
+        "    assert x is not None",
         "    y: Any = x.Any",
         "    z: object = cast(int, y)",
         "    w = int.cast(z)",
@@ -63,7 +64,7 @@ def test_lint_typing_script(tmp_path: Path) -> None:
 
 
 def test_check_docs_script(tmp_path: Path) -> None:
-    """Verify check_docs passes on the repository and catches missing/stub docstrings.
+    """Verify check_docs passes on the repository and catches missing/stub docstrings and @typing.overload.
 
     Args:
         tmp_path: Temporary pytest directory fixture.
@@ -73,11 +74,15 @@ def test_check_docs_script(tmp_path: Path) -> None:
     good_file = tmp_path / "good.py"
     good_lines = [
         '"""Module doc."""',
+        "import typing",
         "from typing import overload",
         "@overload",
         "def f(x: int) -> int:",
         '    """Overload doc."""',
-        "def f(x: int) -> int:",
+        "@typing.overload",
+        "def f(x: float) -> float:",
+        '    """Overload float doc."""',
+        "def f(x: int | float) -> int | float:",
         '    """Compute f.',
         "",
         "    Args:",
@@ -137,8 +142,29 @@ def test_check_deps_script(tmp_path: Path) -> None:
     """
     assert check_deps.main(["src/zero_flax"]) == 0
     assert check_deps.is_stdlib("os")
+    assert check_deps.is_stdlib("pathlib")
     assert check_deps.is_stdlib("sys")
+    assert not check_deps.is_stdlib("pytest")
     assert not check_deps.is_stdlib("nonexistent_third_party_pkg_xyz")
+
+    good_cross_imp = tmp_path / "good_cross_imp.py"
+    good_cross_imp.write_text(
+        NL.join(
+            [
+                "import zero_chex",
+                "import zero_grain",
+                "import zero_optax",
+                "import zero_orbax",
+                "import zero_jax",
+                "from zero_chex import assert_shape",
+                "from zero_optax import adamw",
+                "from zero_orbax import checkpoint",
+                "from zero_grain import DataLoader",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    assert check_deps.main([str(good_cross_imp)]) == 0
 
     bad_imp = tmp_path / "bad_imp.py"
     bad_imp.write_text(
@@ -194,7 +220,17 @@ def test_check_compiler_and_parity_tests_scripts(tmp_path: Path) -> None:
 
     vacuous_parity = tmp_path / "vacuous.py"
     vacuous_parity.write_text(
-        NL.join(["def test_linear_parity() -> None:", "    pass"]),
+        NL.join(
+            [
+                "def test_linear_parity() -> None:",
+                "    pass",
+                "def test_dense_parity() -> None:",
+                "    x = print(1)",
+                "    assert x.shape == (1, 1)",
+                "def test_conv_parity() -> None:",
+                "    assert_allclose(1, 1)",
+            ]
+        ),
         encoding="utf-8",
     )
     assert check_compiler_tests.main([str(vacuous_parity)]) == 1

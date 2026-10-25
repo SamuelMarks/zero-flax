@@ -10,7 +10,7 @@ import zero_flax.nnx as zero_nnx
 
 
 def test_linear_parity() -> None:
-    """Verify Linear forward pass computes y = x @ W + b accurately."""
+    """Verify Linear forward pass computes y = x @ W + b accurately on asymmetric inputs."""
     layer = zero_nnx.Linear(
         in_features=3,
         out_features=2,
@@ -18,14 +18,14 @@ def test_linear_parity() -> None:
         bias_init=initializers.ones,
         rngs=zero_nnx.Rngs(0),
     )
-    x = np.array([[1.0, 2.0, 3.0]], dtype=np.float32)
+    x = np.array([[1.0, 2.0, 3.0], [0.5, -1.0, 2.5]], dtype=np.float32)
     out = np.asarray(layer(x))
-    expected = np.array([[7.0, 7.0]], dtype=np.float32)
+    expected = np.array([[7.0, 7.0], [3.0, 3.0]], dtype=np.float32)
     np.testing.assert_allclose(out, expected, rtol=1e-5, atol=1e-5)
 
 
 def test_dense_parity() -> None:
-    """Verify Dense forward pass matches Linear mathematical computation."""
+    """Verify Dense forward pass matches Linear mathematical computation on asymmetric inputs."""
     layer = zero_nnx.Dense(
         in_features=2,
         out_features=3,
@@ -33,9 +33,9 @@ def test_dense_parity() -> None:
         bias_init=initializers.zeros,
         rngs=zero_nnx.Rngs(0),
     )
-    x = np.array([[2.0, 3.0]], dtype=np.float32)
+    x = np.array([[2.0, 3.0], [-1.0, 4.0]], dtype=np.float32)
     out = np.asarray(layer(x))
-    expected = np.array([[5.0, 5.0, 5.0]], dtype=np.float32)
+    expected = np.array([[5.0, 5.0, 5.0], [3.0, 3.0, 3.0]], dtype=np.float32)
     np.testing.assert_allclose(out, expected, rtol=1e-5, atol=1e-5)
 
 
@@ -48,10 +48,11 @@ def test_lineargeneral_parity() -> None:
         bias_init=initializers.zeros,
         rngs=zero_nnx.Rngs(0),
     )
-    x = np.ones((2, 3), dtype=np.float32)
+    x = np.array([[1.0, 2.0, 3.0], [2.0, 0.0, 1.0]], dtype=np.float32)
     out = np.asarray(layer(x))
     assert out.shape == (2, 2, 2)
-    np.testing.assert_allclose(out, np.full((2, 2, 2), 3.0, dtype=np.float32), rtol=1e-5)
+    np.testing.assert_allclose(out[0], np.full((2, 2), 6.0, dtype=np.float32), rtol=1e-5)
+    np.testing.assert_allclose(out[1], np.full((2, 2), 3.0, dtype=np.float32), rtol=1e-5)
 
 
 def test_einsum_parity() -> None:
@@ -64,14 +65,15 @@ def test_einsum_parity() -> None:
         bias_init=initializers.ones,
         rngs=zero_nnx.Rngs(0),
     )
-    x = np.ones((2, 3), dtype=np.float32)
+    x = np.array([[1.0, 2.0, 3.0], [0.0, 1.0, 1.0]], dtype=np.float32)
     out = np.asarray(layer(x))
     assert out.shape == (2, 4)
-    np.testing.assert_allclose(out, np.full((2, 4), 4.0, dtype=np.float32), rtol=1e-5)
+    expected = np.array([[7.0, 7.0, 7.0, 7.0], [3.0, 3.0, 3.0, 3.0]], dtype=np.float32)
+    np.testing.assert_allclose(out, expected, rtol=1e-5)
 
 
 def test_lora_parity() -> None:
-    """Verify LoRA computes low-rank projection (x @ A) @ B."""
+    """Verify LoRA computes low-rank projection (x @ A) @ B on asymmetric inputs."""
     layer = zero_nnx.LoRA(
         in_features=3,
         lora_rank=2,
@@ -80,10 +82,10 @@ def test_lora_parity() -> None:
         b_initializer=initializers.ones,
         rngs=zero_nnx.Rngs(0),
     )
-    x = np.ones((1, 3), dtype=np.float32)
+    x = np.array([[1.0, 2.0, 3.0]], dtype=np.float32)
     out = np.asarray(layer(x))
     assert out.shape == (1, 4)
-    np.testing.assert_allclose(out, np.full((1, 4), 6.0, dtype=np.float32), rtol=1e-5)
+    np.testing.assert_allclose(out, np.full((1, 4), 12.0, dtype=np.float32), rtol=1e-5)
 
 
 def test_loralinear_parity() -> None:
@@ -98,14 +100,14 @@ def test_loralinear_parity() -> None:
         b_initializer=initializers.ones,
         rngs=zero_nnx.Rngs(0),
     )
-    x = np.ones((1, 3), dtype=np.float32)
+    x = np.array([[1.0, 2.0, 3.0]], dtype=np.float32)
     out = np.asarray(layer(x))
     assert out.shape == (1, 4)
-    np.testing.assert_allclose(out, np.full((1, 4), 9.0, dtype=np.float32), rtol=1e-5)
+    np.testing.assert_allclose(out, np.full((1, 4), 18.0, dtype=np.float32), rtol=1e-5)
 
 
 def test_conv_parity() -> None:
-    """Verify Conv 2D spatial convolution with SAME and VALID padding."""
+    """Verify Conv 2D spatial convolution with VALID padding on asymmetric spatial patches."""
     conv = zero_nnx.Conv(
         in_features=2,
         out_features=3,
@@ -115,10 +117,17 @@ def test_conv_parity() -> None:
         bias_init=initializers.zeros,
         rngs=zero_nnx.Rngs(0),
     )
-    x = np.ones((1, 3, 3, 2), dtype=np.float32)
+    x = np.arange(1, 19, dtype=np.float32).reshape((1, 3, 3, 2))
     out = np.asarray(conv(x))
     assert out.shape == (1, 2, 2, 3)
-    np.testing.assert_allclose(out, np.full((1, 2, 2, 3), 8.0, dtype=np.float32), rtol=1e-5)
+    expected_00 = float(np.sum(x[0, 0:2, 0:2, :]))
+    expected_11 = float(np.sum(x[0, 1:3, 1:3, :]))
+    np.testing.assert_allclose(
+        out[0, 0, 0], np.full((3,), expected_00, dtype=np.float32), rtol=1e-5
+    )
+    np.testing.assert_allclose(
+        out[0, 1, 1], np.full((3,), expected_11, dtype=np.float32), rtol=1e-5
+    )
 
 
 def test_convtranspose_parity() -> None:
@@ -155,20 +164,34 @@ def test_convtranspose_parity() -> None:
 
 
 def test_embed_parity() -> None:
-    """Verify Embed lookup and attend dot product similarity."""
+    """Verify Embed lookup and attend dot product similarity with distinct token rows."""
     emb = zero_nnx.Embed(
         num_embeddings=4,
         features=3,
         embedding_init=initializers.ones,
         rngs=zero_nnx.Rngs(0),
     )
-    idx = np.array([[0, 2]], dtype=np.int32)
+    emb.embedding.value = jnp.array(
+        [
+            [1.0, 0.0, 0.0],
+            [0.0, 2.0, 0.0],
+            [0.0, 0.0, 3.0],
+            [1.0, 2.0, 3.0],
+        ],
+        dtype="float32",
+    )
+    idx = np.array([[0, 2, 3]], dtype=np.int32)
     looked_up = np.asarray(emb(idx))
-    assert looked_up.shape == (1, 2, 3)
-    np.testing.assert_allclose(looked_up, np.ones((1, 2, 3), dtype=np.float32), rtol=1e-5)
+    assert looked_up.shape == (1, 3, 3)
+    expected_lookup = np.array(
+        [[[1.0, 0.0, 0.0], [0.0, 0.0, 3.0], [1.0, 2.0, 3.0]]], dtype=np.float32
+    )
+    np.testing.assert_allclose(looked_up, expected_lookup, rtol=1e-5)
     scores = np.asarray(emb.attend(looked_up))
-    assert scores.shape == (1, 2, 4)
-    np.testing.assert_allclose(scores, np.full((1, 2, 4), 3.0, dtype=np.float32), rtol=1e-5)
+    assert scores.shape == (1, 3, 4)
+    np.testing.assert_allclose(
+        scores[0, 2], np.array([1.0, 4.0, 9.0, 14.0], dtype=np.float32), rtol=1e-5
+    )
 
 
 def test_batchnorm_parity() -> None:
@@ -207,9 +230,10 @@ def test_layernorm_parity() -> None:
 def test_rmsnorm_parity() -> None:
     """Verify RMSNorm scales input by reciprocal root-mean-square."""
     rn = zero_nnx.RMSNorm(num_features=3, epsilon=0.0, rngs=zero_nnx.Rngs(0))
-    x = np.array([[2.0, 2.0, 2.0]], dtype=np.float32)
+    x = np.array([[1.0, 2.0, 3.0]], dtype=np.float32)
     out = np.asarray(rn(x))
-    np.testing.assert_allclose(out, np.ones((1, 3), dtype=np.float32), rtol=1e-5, atol=1e-5)
+    expected = x / np.sqrt(np.mean(x * x, axis=-1, keepdims=True))
+    np.testing.assert_allclose(out, expected, rtol=1e-5, atol=1e-5)
 
 
 def test_groupnorm_parity() -> None:
@@ -245,10 +269,10 @@ def test_spectralnorm_parity() -> None:
         rngs=zero_nnx.Rngs(0),
     )
     sn = zero_nnx.SpectralNorm(linear, n_steps=2, rngs=zero_nnx.Rngs(0))
-    x = np.ones((1, 2), dtype=np.float32)
+    x = np.array([[1.0, 3.0]], dtype=np.float32)
     out = np.asarray(sn(x))
     assert out.shape == (1, 2)
-    np.testing.assert_allclose(out, np.ones((1, 2), dtype=np.float32), rtol=1e-4, atol=1e-4)
+    np.testing.assert_allclose(out, np.array([[2.0, 2.0]], dtype=np.float32), rtol=1e-4, atol=1e-4)
 
 
 def test_weightnorm_parity() -> None:
@@ -261,9 +285,9 @@ def test_weightnorm_parity() -> None:
         rngs=zero_nnx.Rngs(0),
     )
     wn = zero_nnx.WeightNorm(linear, rngs=zero_nnx.Rngs(0))
-    x = np.ones((1, 2), dtype=np.float32)
+    x = np.array([[1.0, 3.0]], dtype=np.float32)
     out = np.asarray(wn(x))
-    expected_val = float(2.0 / np.sqrt(2.0))
+    expected_val = float(4.0 / np.sqrt(2.0))
     np.testing.assert_allclose(
         out, np.full((1, 2), expected_val, dtype=np.float32), rtol=1e-4, atol=1e-4
     )
@@ -272,7 +296,7 @@ def test_weightnorm_parity() -> None:
 def test_dropout_parity() -> None:
     """Verify Dropout deterministic pass and rate=1.0 zeroing."""
     drop = zero_nnx.Dropout(rate=0.5, deterministic=False, rngs=zero_nnx.Rngs(0))
-    x = np.ones((4, 4), dtype=np.float32)
+    x = np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)
     out_det = np.asarray(drop(x, deterministic=True))
     np.testing.assert_allclose(out_det, x)
     drop_all = zero_nnx.Dropout(rate=1.0, deterministic=False, rngs=zero_nnx.Rngs(0))
@@ -288,10 +312,10 @@ def test_multiheadattention_parity() -> None:
         bias_init=initializers.zeros,
         rngs=zero_nnx.Rngs(0),
     )
-    x = np.ones((1, 3, 4), dtype=np.float32)
+    x = np.array([[[1.0, 2.0, 1.0, 0.0], [0.0, 1.0, 2.0, 1.0]]], dtype=np.float32)
     out = np.asarray(mha(x))
-    assert out.shape == (1, 3, 4)
-    np.testing.assert_allclose(out, np.full((1, 3, 4), 16.0, dtype=np.float32), rtol=1e-4)
+    assert out.shape == (1, 2, 4)
+    np.testing.assert_allclose(out, np.full((1, 2, 4), 16.0, dtype=np.float32), rtol=1e-4)
 
 
 def test_multiheaddotproductattention_parity() -> None:
@@ -303,7 +327,7 @@ def test_multiheaddotproductattention_parity() -> None:
         bias_init=initializers.zeros,
         rngs=zero_nnx.Rngs(0),
     )
-    x = np.ones((1, 2, 4), dtype=np.float32)
+    x = np.array([[[0.5, 1.5, 1.0, 1.0], [1.0, 0.5, 1.5, 1.0]]], dtype=np.float32)
     out = np.asarray(mha(x))
     assert out.shape == (1, 2, 4)
     np.testing.assert_allclose(out, np.full((1, 2, 4), 16.0, dtype=np.float32), rtol=1e-4)
@@ -316,6 +340,9 @@ def test_rope_parity() -> None:
     out = np.asarray(rope(x))
     assert out.shape == (1, 2, 4)
     np.testing.assert_allclose(out[:, 0, :], x[:, 0, :], rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(
+        np.sum(out[:, 1, :] ** 2), np.sum(x[:, 1, :] ** 2), rtol=1e-5, atol=1e-5
+    )
 
 
 def test_prelu_parity() -> None:
@@ -338,10 +365,10 @@ def test_simplecell_parity() -> None:
         rngs=zero_nnx.Rngs(0),
     )
     assert isinstance(cell, zero_nnx.RNNCellBase)
-    x = np.ones((1, 3), dtype=np.float32)
+    x = np.array([[1.0, 2.0, 3.0]], dtype=np.float32)
     carry = cell.initialize_carry(x.shape)
     new_carry, out = cell(carry, x)
-    expected = np.tanh(np.full((1, 2), 3.0, dtype=np.float32))
+    expected = np.tanh(np.full((1, 2), 6.0, dtype=np.float32))
     np.testing.assert_allclose(np.asarray(out), expected, rtol=1e-5, atol=1e-5)
     np.testing.assert_allclose(np.asarray(new_carry), expected, rtol=1e-5, atol=1e-5)
 
@@ -351,17 +378,21 @@ def test_grucell_parity() -> None:
     cell = zero_nnx.GRUCell(
         in_features=2,
         hidden_features=3,
-        kernel_init=initializers.zeros,
+        kernel_init=initializers.ones,
         recurrent_kernel_init=initializers.zeros,
         bias_init=initializers.zeros,
         rngs=zero_nnx.Rngs(0),
     )
-    x = np.ones((2, 2), dtype=np.float32)
+    x = np.array([[1.0, 2.0]], dtype=np.float32)
     carry = cell.initialize_carry(x.shape)
     new_carry, out = cell(carry, x)
-    assert new_carry.shape == (2, 3)
-    assert out.shape == (2, 3)
-    np.testing.assert_allclose(np.asarray(out), np.zeros((2, 3), dtype=np.float32), atol=1e-5)
+    assert new_carry.shape == (1, 3)
+    assert out.shape == (1, 3)
+    sig_3 = 1.0 / (1.0 + np.exp(-3.0))
+    exp_val = (1.0 - sig_3) * np.tanh(3.0)
+    np.testing.assert_allclose(
+        np.asarray(out), np.full((1, 3), exp_val, dtype=np.float32), rtol=1e-5, atol=1e-5
+    )
 
 
 def test_lstmcell_parity() -> None:
@@ -374,7 +405,7 @@ def test_lstmcell_parity() -> None:
         bias_init=initializers.zeros,
         rngs=zero_nnx.Rngs(0),
     )
-    x = np.ones((1, 2), dtype=np.float32)
+    x = np.array([[0.5, 1.5]], dtype=np.float32)
     carry = cell.initialize_carry(x.shape)
     (new_c, new_h), out = cell(carry, x)
     assert new_c.shape == (1, 3)
@@ -397,7 +428,7 @@ def test_optimizedlstmcell_parity() -> None:
         bias_init=initializers.zeros,
         rngs=zero_nnx.Rngs(0),
     )
-    x = np.ones((1, 2), dtype=np.float32)
+    x = np.array([[0.5, 1.5]], dtype=np.float32)
     carry = cell.initialize_carry(x.shape)
     (new_c, new_h), out = cell(carry, x)
     assert new_c.shape == (1, 3)
@@ -421,7 +452,7 @@ def test_rnn_parity() -> None:
         rngs=zero_nnx.Rngs(0),
     )
     rnn = zero_nnx.RNN(cell)
-    x = np.ones((1, 3, 2), dtype=np.float32)
+    x = np.array([[[0.5, 1.5], [1.0, 1.0], [1.5, 0.5]]], dtype=np.float32)
     out = np.asarray(rnn(x))
     assert out.shape == (1, 3, 2)
     h1 = np.tanh(np.full((1, 2), 2.0, dtype=np.float32))
@@ -473,15 +504,15 @@ def test_sequential_parity() -> None:
             3, 1, kernel_init=initializers.ones, bias_init=initializers.zeros, rngs=zero_nnx.Rngs(1)
         ),
     )
-    x = np.ones((2, 2), dtype=np.float32)
+    x = np.array([[1.0, 2.0], [-1.0, 0.5]], dtype=np.float32)
     out = np.asarray(seq(x))
     assert out.shape == (2, 1)
-    np.testing.assert_allclose(out, np.full((2, 1), 6.0, dtype=np.float32), rtol=1e-5)
+    np.testing.assert_allclose(out, np.array([[9.0], [0.0]], dtype=np.float32), rtol=1e-5)
 
 
 def test_dict_parity() -> None:
     """Verify nnx.Dict registers child modules and supports state round-tripping."""
-    d = zero_nnx.Dict(
+    d: zero_nnx.Dict[zero_nnx.Linear] = zero_nnx.Dict(
         {
             "a": zero_nnx.Linear(
                 2,
@@ -492,9 +523,9 @@ def test_dict_parity() -> None:
             )
         }
     )
-    x = np.ones((1, 2), dtype=np.float32)
+    x = np.array([[1.0, 3.0]], dtype=np.float32)
     out = np.asarray(d["a"](x))
-    np.testing.assert_allclose(out, np.full((1, 3), 2.0, dtype=np.float32), rtol=1e-5)
+    np.testing.assert_allclose(out, np.full((1, 3), 4.0, dtype=np.float32), rtol=1e-5)
     gdef, st = zero_nnx.split(d)
     assert "a" in st
     d2 = zero_nnx.merge(gdef, st)
@@ -503,7 +534,7 @@ def test_dict_parity() -> None:
 
 def test_list_parity() -> None:
     """Verify nnx.List registers child modules by index and evaluates numerically."""
-    lst = zero_nnx.List(
+    lst: zero_nnx.List[zero_nnx.Linear] = zero_nnx.List(
         [
             zero_nnx.Linear(
                 2,
@@ -514,10 +545,10 @@ def test_list_parity() -> None:
             )
         ]
     )
-    x = np.ones((1, 2), dtype=np.float32)
+    x = np.array([[2.0, 5.0]], dtype=np.float32)
     out = np.asarray(lst[0](x))
     assert out.shape == (1, 3)
-    np.testing.assert_allclose(out, np.full((1, 3), 2.0, dtype=np.float32), rtol=1e-5)
+    np.testing.assert_allclose(out, np.full((1, 3), 7.0, dtype=np.float32), rtol=1e-5)
 
 
 def test_jit_parity() -> None:
@@ -527,9 +558,9 @@ def test_jit_parity() -> None:
             2, 3, kernel_init=initializers.ones, bias_init=initializers.zeros, rngs=zero_nnx.Rngs(0)
         )
     )
-    x = np.ones((1, 2), dtype=np.float32)
+    x = np.array([[1.5, 2.5]], dtype=np.float32)
     out = np.asarray(jitted(x))
-    np.testing.assert_allclose(out, np.full((1, 3), 2.0, dtype=np.float32), rtol=1e-5)
+    np.testing.assert_allclose(out, np.full((1, 3), 4.0, dtype=np.float32), rtol=1e-5)
 
 
 def test_remat_parity() -> None:
@@ -539,9 +570,9 @@ def test_remat_parity() -> None:
             2, 3, kernel_init=initializers.ones, bias_init=initializers.zeros, rngs=zero_nnx.Rngs(0)
         )
     )
-    x = np.ones((1, 2), dtype=np.float32)
+    x = np.array([[1.5, 2.5]], dtype=np.float32)
     out = np.asarray(rematted(x))
-    np.testing.assert_allclose(out, np.full((1, 3), 2.0, dtype=np.float32), rtol=1e-5)
+    np.testing.assert_allclose(out, np.full((1, 3), 4.0, dtype=np.float32), rtol=1e-5)
 
 
 def test_vmap_parity() -> None:
@@ -553,10 +584,11 @@ def test_vmap_parity() -> None:
         in_axes=0,
         out_axes=0,
     )
-    x = np.ones((4, 2), dtype=np.float32)
+    x = np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)
     out = np.asarray(vmapped(x))
-    assert out.shape == (4, 3)
-    np.testing.assert_allclose(out, np.full((4, 3), 2.0, dtype=np.float32), rtol=1e-5)
+    assert out.shape == (2, 3)
+    expected = np.array([[3.0, 3.0, 3.0], [7.0, 7.0, 7.0]], dtype=np.float32)
+    np.testing.assert_allclose(out, expected, rtol=1e-5)
 
 
 def test_scan_parity() -> None:
@@ -571,17 +603,17 @@ def test_scan_parity() -> None:
     )
     scanned = zero_nnx.Scan(cell, in_axes=1, out_axes=1)
     carry = jnp.zeros((1, 2))
-    xs = np.ones((1, 3, 2), dtype=np.float32)
+    xs = np.array([[[1.0, 1.0], [2.0, 1.0], [0.5, 0.5]]], dtype=np.float32)
     res = scanned(carry, xs)
     assert isinstance(res, tuple)
     final_carry, ys = res[0], res[1]
     assert final_carry.shape == (1, 2)
     assert ys.shape == (1, 3, 2)
-    exp_step = np.tanh(np.full((1, 2), 2.0, dtype=np.float32))
-    np.testing.assert_allclose(np.asarray(final_carry), exp_step, rtol=1e-5, atol=1e-5)
-    np.testing.assert_allclose(
-        np.asarray(ys), np.stack([exp_step, exp_step, exp_step], axis=1), rtol=1e-5, atol=1e-5
-    )
+    s0 = np.tanh(np.full((1, 2), 2.0, dtype=np.float32))
+    s1 = np.tanh(np.full((1, 2), 3.0, dtype=np.float32))
+    s2 = np.tanh(np.full((1, 2), 1.0, dtype=np.float32))
+    np.testing.assert_allclose(np.asarray(final_carry), s2, rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(np.asarray(ys), np.stack([s0, s1, s2], axis=1), rtol=1e-5, atol=1e-5)
 
 
 def test_pmap_parity() -> None:
@@ -593,7 +625,8 @@ def test_pmap_parity() -> None:
         in_axes=0,
         out_axes=0,
     )
-    x = np.ones((2, 2), dtype=np.float32)
+    x = np.array([[1.0, 2.0], [4.0, 5.0]], dtype=np.float32)
     out = np.asarray(pmapped(x))
     assert out.shape == (2, 3)
-    np.testing.assert_allclose(out, np.full((2, 3), 2.0, dtype=np.float32), rtol=1e-5)
+    expected = np.array([[3.0, 3.0, 3.0], [9.0, 9.0, 9.0]], dtype=np.float32)
+    np.testing.assert_allclose(out, expected, rtol=1e-5)

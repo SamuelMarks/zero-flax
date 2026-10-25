@@ -1,40 +1,34 @@
 """Parity verification entrypoint script for the zero-flax repository.
 
 This script verifies that `tests/test_parity_flax.py` exists and passes all
-AST-level layer parity checks across all 35 NNX classes.
+AST-level layer parity and value-assertion checks across all 35 NNX classes.
 """
 
 from __future__ import annotations
 
-import ast
 import os
 import sys
 from collections.abc import Sequence
 
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+from scripts.check_compiler_tests import check_parity_file
+
 
 def verify_parity(parity_test_path: str = "tests/test_parity_flax.py") -> bool:
-    """Check that ``parity_test_path`` exists and contains non-vacuous parity tests.
+    """Check that ``parity_test_path`` exists and contains non-vacuous value-asserting parity tests.
 
     Args:
         parity_test_path: Path to ``tests/test_parity_flax.py``.
 
     Returns:
-        ``True`` if the parity test file exists and has non-vacuous test definitions, ``False`` otherwise.
+        ``True`` if the parity test file exists and passes all 35 layer checks, ``False`` otherwise.
     """
     print("Verifying parity with flax...")
     if not os.path.exists(parity_test_path):
         return False
-    with open(parity_test_path, encoding="utf-8") as handle:
-        source = handle.read()
-    tree = ast.parse(source, filename=parity_test_path)
-    test_fns = [
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.FunctionDef) and node.name.startswith("test_")
-    ]
-    if len(test_fns) < 35 or any(
-        not any(isinstance(sub, (ast.Assert, ast.Call)) for sub in ast.walk(fn)) for fn in test_fns
-    ):
+    errors = check_parity_file(parity_test_path)
+    if errors:
         return False
     print("Parity verification passed.")
     return True

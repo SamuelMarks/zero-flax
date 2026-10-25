@@ -1,11 +1,12 @@
 """Random number generator stream management (`Rngs` and `RngStream`) for zero-flax NNX.
 
 This module implements deterministic PRNG key streams backed by `zero_jax.random`
-(`PRNGKey`, `fold_in`, `split`) without `Any`, `object`, or reflection.
+(`PRNGKey`, `fold_in`, `split`) without `Any`, `object`, or `__getattr__` reflection.
 """
 
 from __future__ import annotations
 
+import zlib
 from collections.abc import Sequence
 from typing import Optional, Union
 
@@ -17,217 +18,288 @@ from zero_flax.nnx.variables import Rng, RngCount, RngKey, RngState
 from zero_flax.types import JaxArray, PRNGKeyLike, ensure_array
 
 
-def _normalize_key(seed_or_key: PRNGKeyLike) -> JaxArray:
-    """Convert an integer seed or key array into a 2-element ``JaxArray`` PRNG key.
+def _collection_tag_hash(collection: str) -> int:
+    """Compute a deterministic 31-bit integer tag for an RNG collection name.
 
     Args:
-        seed_or_key: Integer seed, tuple of ints, or existing PRNG key tensor.
+        collection: Name of the RNG stream (e.g., ``"params"``, ``"dropout"``).
 
     Returns:
-        Normalized PRNG key ``JaxArray``.
+        Deterministic non-negative integer hash in ``[0, 2**31 - 1]``.
+    """
+    return (
+        0 if collection == "default" else int(zlib.adler32(collection.encode("utf-8")) & 0x7FFFFFFF)
+    )
+
+
+def _to_prng_key(seed_or_key: PRNGKeyLike) -> JaxArray:
+    """Convert an integer seed or key-like value into a 2-element ``uint32`` PRNG key array.
+
+    Args:
+        seed_or_key: Integer seed, pair of ints, existing ``JaxArray`` key, or ``None``.
+
+    Returns:
+        2-element ``JaxArray`` PRNG key.
     """
     if seed_or_key is None:
         res_zero: JaxArray = jrandom.PRNGKey(0)
         return res_zero
     if isinstance(seed_or_key, int):
-        res_int: JaxArray = jrandom.PRNGKey(seed_or_key)
+        res_int: JaxArray = jrandom.PRNGKey(int(seed_or_key))
         return res_int
-    return ensure_array(seed_or_key)
+    arr = ensure_array(seed_or_key)
+    if arr.ndim == 0:
+        res_scalar: JaxArray = jrandom.PRNGKey(0)
+        return res_scalar
+    return arr
 
 
 class RngStream(Module):
-    """Stateful stream of PRNG keys supporting deterministic fold-in and fork splitting.
+    """Stateful PRNG key stream tracking a base `RngKey` and a monotonically increasing `RngCount`.
 
     Attributes:
-        key: Base ``RngKey`` variable holding the root PRNG key tensor.
-        count: ``RngCount`` variable tracking how many keys have been drawn.
-        tag: String identifier name of this RNG stream (e.g., ``"params"``, ``"dropout"``).
+        key: Registered ``RngKey`` variable holding the base 2-element PRNG key.
+        count: Registered ``RngCount`` variable tracking the number of keys generated.
+        tag: Stream collection name (e.g., ``"default"``, ``"params"``, ``"dropout"``).
     """
 
     key: RngKey
     count: RngCount
     tag: str
 
-    def __init__(self, key: PRNGKeyLike = 0, tag: str = "default") -> None:
-        """Initialize an RngStream with a seed or PRNG key and stream tag.
+    def __init__(
+        self,
+        key: PRNGKeyLike = 0,
+        *,
+        tag: str = "default",
+        count: int = 0,
+    ) -> None:
+        """Initialize an RngStream with a seed or key and optional stream tag.
 
         Args:
-            key: Integer seed or PRNG key tensor. Defaults to ``0``.
-            tag: Stream collection name. Defaults to ``"default"``.
+            key: Initial integer seed or PRNG key array. Defaults to ``0``.
+            tag: Stream identifier string. Defaults to ``"default"``.
+            count: Initial call count. Defaults to ``0``.
         """
-        super().__init__()
+        super().__init__(tag=tag)
         self.tag = tag
-        self.key = self.register_variable("key", RngKey(_normalize_key(key), tag=tag))
-        self.count = self.register_variable("count", RngCount(0, tag=tag))
+        prng_key = _to_prng_key(key)
+        self.key = self.register_variable("key", RngKey(prng_key, tag=tag))
+        self.count = self.register_variable("count", RngCount(count, tag=tag))
         self.finish_init()
 
     def __call__(self) -> JaxArray:
-        """Draw a fresh deterministic PRNG key by folding ``self.count`` into ``self.key``.
+        """Generate the next deterministic PRNG key by folding ``count`` into ``key`` and incrementing ``count``.
 
         Returns:
-            Fresh PRNG key ``JaxArray``.
+            Newly folded 2-element ``JaxArray`` PRNG key.
         """
-        step = self.count.value
-        self.count.value = step + 1
-        derived: JaxArray = jrandom.fold_in(self.key.value, step)
-        return derived
+        current_count = int(self.count.value)
+        self.count.value = current_count + 1
+        folded: JaxArray = jrandom.fold_in(self.key.value, current_count)
+        return folded
 
-    def fork(self, split_size: Optional[Union[int, Sequence[int]]] = None) -> JaxArray:
-        """Split a fresh PRNG key into multiple sub-keys for vectorized or parallel transforms.
+    def fork(self, split: Optional[Union[int, Sequence[int]]] = None) -> JaxArray:
+        """Fork a new PRNG key (or batch of ``split`` keys) from this stream.
 
         Args:
-            split_size: Optional number of splits or shape of split keys.
+            split: Optional number or shape of subkeys to split the forked key into.
 
         Returns:
-            Split PRNG key ``JaxArray`` of shape ``(split_size, 2)`` or ``(*split_size, 2)``.
+            Forked ``JaxArray`` key of shape ``(2,)`` or ``(*split, 2)``.
         """
-        base_key = self()
-        if split_size is None:
-            return base_key
-        if isinstance(split_size, int):
-            split_res: JaxArray = jrandom.split(base_key, split_size)
-            return split_res
-        dims = tuple(int(d) for d in split_size)
-        total = 1
-        for dim in dims:
-            total *= dim
-        split_flat: JaxArray = jrandom.split(base_key, total)
-        key_last_dim = split_flat.shape[-1] if split_flat.ndim >= 2 else 2
-        reshaped: JaxArray = jnp.reshape(split_flat, (*dims, key_last_dim))
-        return reshaped
+        next_key = self()
+        if split is not None:
+            if isinstance(split, int):
+                split_keys: JaxArray = jrandom.split(next_key, int(split))
+                return split_keys
+            shape_tuple = tuple(int(d) for d in split)
+            total = 1
+            for d in shape_tuple:
+                total *= d
+            flat_keys = jrandom.split(next_key, total)
+            reshaped: JaxArray = jnp.reshape(flat_keys, (*shape_tuple, 2))
+            return reshaped
+        return next_key
 
 
 class Rngs(Module):
-    """Collection of named ``RngStream`` generators for NNX module initialization and execution.
+    """Collection of named `RngStream` instances for parameter initialization, dropout, and carry generation.
 
     Attributes:
-        _streams: Dictionary mapping stream names to ``RngStream`` instances.
+        _streams: Dictionary mapping stream names (``"default"``, ``"params"``, ``"dropout"``, etc.)
+            to child ``RngStream`` modules.
     """
 
     _streams: dict[str, RngStream]
 
     def __init__(
         self,
-        default: PRNGKeyLike = 0,
-        **streams: PRNGKeyLike,
+        default: PRNGKeyLike = None,
+        **rngs: PRNGKeyLike,
     ) -> None:
-        """Initialize an Rngs collection with a default seed/key and optional named streams.
+        """Initialize an Rngs collection with an optional default seed/key and named stream seeds/keys.
 
         Args:
-            default: Default integer seed or PRNG key used for unnamed or fallback streams.
-            **streams: Named PRNG seeds or keys (e.g., ``params=0``, ``dropout=1``).
+            default: Optional seed or PRNG key for the ``"default"`` fallback stream.
+            **rngs: Named seeds or PRNG keys (e.g., ``params=0``, ``dropout=1``).
         """
         super().__init__()
         self._streams = {}
-        if default is not None:
-            def_stream = RngStream(default, tag="default")
-            self._streams["default"] = self.register_child("default", def_stream)
-        for name, seed_val in streams.items():
-            named_stream = RngStream(seed_val, tag=name)
-            self._streams[name] = self.register_child(name, named_stream)
+        if default is not None or not rngs:
+            seed_val: PRNGKeyLike = 0 if default is None else default
+            self._register_stream("default", seed_val)
+        for stream_name, stream_seed in rngs.items():
+            self._register_stream(stream_name, stream_seed)
         self.finish_init()
 
-    def _get_or_create_stream(self, name: str) -> RngStream:
-        """Retrieve the named ``RngStream``, or fall back to ``"default"``.
+    def _register_stream(
+        self, name: str, seed_or_stream: Union[PRNGKeyLike, RngStream]
+    ) -> RngStream:
+        """Create or register an ``RngStream`` under ``name``.
 
         Args:
-            name: Name of the requested RNG stream.
+            name: Stream collection name.
+            seed_or_stream: Seed/key value or existing ``RngStream`` instance.
 
         Returns:
-            Corresponding ``RngStream`` instance.
+            Registered ``RngStream`` child module.
+        """
+        if isinstance(seed_or_stream, RngStream):
+            stream = seed_or_stream
+        else:
+            stream = RngStream(seed_or_stream, tag=name)
+        self._streams[name] = stream
+        self.register_child(name, stream)
+        return stream
+
+    def _get_or_create_stream(self, name: str) -> RngStream:
+        """Return the ``RngStream`` for ``name``, falling back to ``"default"`` if registered.
+
+        Args:
+            name: Requested stream name.
+
+        Returns:
+            Matching or fallback ``RngStream``.
 
         Raises:
-            KeyError: If neither ``name`` nor ``"default"`` is configured in ``self._streams``.
+            KeyError: If neither ``name`` nor ``"default"`` exists in ``self._streams``.
         """
         if name in self._streams:
             return self._streams[name]
         if "default" in self._streams:
             return self._streams["default"]
-        raise KeyError(
-            f"No RNG stream found for {name!r} and no 'default' stream configured on Rngs."
-        )
-
-    def __call__(self, name: str = "default") -> JaxArray:
-        """Draw a fresh PRNG key from the specified stream (or ``"default"`` fallback).
-
-        Args:
-            name: Stream name to sample from. Defaults to ``"default"``.
-
-        Returns:
-            Fresh PRNG key ``JaxArray``.
-        """
-        return self._get_or_create_stream(name)()
-
-    def default(self) -> JaxArray:
-        """Draw a fresh PRNG key from the ``"default"`` stream.
-
-        Returns:
-            Fresh PRNG key ``JaxArray``.
-        """
-        return self("default")
-
-    def params(self) -> JaxArray:
-        """Draw a fresh PRNG key from the ``"params"`` stream.
-
-        Returns:
-            Fresh PRNG key ``JaxArray``.
-        """
-        return self("params")
-
-    def dropout(self) -> JaxArray:
-        """Draw a fresh PRNG key from the ``"dropout"`` stream.
-
-        Returns:
-            Fresh PRNG key ``JaxArray``.
-        """
-        return self("dropout")
+        raise KeyError(f"No RNG stream named {name!r} and no 'default' stream configured in Rngs.")
 
     def __getitem__(self, name: str) -> RngStream:
-        """Access the ``RngStream`` for ``name``.
+        """Retrieve an ``RngStream`` by ``name`` (falling back to ``"default"``).
 
         Args:
-            name: Stream name.
+            name: Stream name (e.g., ``"params"``, ``"dropout"``).
 
         Returns:
-            The ``RngStream`` associated with ``name``.
+            Corresponding ``RngStream`` instance.
         """
         return self._get_or_create_stream(name)
 
-    def has_stream(self, name: str) -> bool:
-        """Check whether an explicit or fallback stream is available for ``name``.
+    def __call__(self, name: str = "default") -> JaxArray:
+        """Draw the next PRNG key from stream ``name`` (or ``"default"``).
+
+        When falling back to the ``"default"`` stream for a specific non-default
+        ``name``, a deterministic collection tag hash is folded into the drawn key
+        so different collections (such as ``"params"`` and ``"dropout"``) never collide.
 
         Args:
-            name: Stream name to check.
+            name: Stream name to draw from. Defaults to ``"default"``.
 
         Returns:
-            ``True`` if ``name`` or ``"default"`` exists in ``self._streams``.
+            Next 2-element ``JaxArray`` PRNG key.
         """
-        return name in self._streams or "default" in self._streams
+        stream = self._get_or_create_stream(name)
+        raw_key = stream()
+        if name not in self._streams and name != "default":
+            tag_hash = _collection_tag_hash(name)
+            folded_tag: JaxArray = jrandom.fold_in(raw_key, tag_hash)
+            return folded_tag
+        return raw_key
+
+    @property
+    def default(self) -> RngStream:
+        """Return the ``"default"`` ``RngStream``.
+
+        Returns:
+            The ``"default"`` ``RngStream`` instance.
+        """
+        return self._get_or_create_stream("default")
+
+    @property
+    def params(self) -> RngStream:
+        """Return the ``"params"`` ``RngStream`` (or ``"default"`` fallback).
+
+        Returns:
+            The ``"params"`` ``RngStream`` instance.
+        """
+        return self._get_or_create_stream("params")
+
+    @property
+    def dropout(self) -> RngStream:
+        """Return the ``"dropout"`` ``RngStream`` (or ``"default"`` fallback).
+
+        Returns:
+            The ``"dropout"`` ``RngStream`` instance.
+        """
+        return self._get_or_create_stream("dropout")
+
+    @property
+    def carry(self) -> RngStream:
+        """Return the ``"carry"`` ``RngStream`` (or ``"default"`` fallback).
+
+        Returns:
+            The ``"carry"`` ``RngStream`` instance.
+        """
+        return self._get_or_create_stream("carry")
+
+    def fork(self, split: Optional[Union[int, Sequence[int]]] = None) -> JaxArray:
+        """Fork a key (or ``split`` keys) from the default stream.
+
+        Args:
+            split: Optional number or shape of subkeys to split into.
+
+        Returns:
+            Forked ``JaxArray`` PRNG key(s).
+        """
+        first_stream = (
+            self._streams["default"]
+            if "default" in self._streams
+            else next(iter(self._streams.values()))
+        )
+        return first_stream.fork(split=split)
 
 
 def resolve_rng_key(
-    rngs: Optional[Union[Rngs, RngStream, bool]],
+    rngs: Union[Rngs, RngStream, PRNGKeyLike],
     collection: str = "params",
-    fold_index: Optional[int] = None,
+    fold_index: int = 0,
 ) -> JaxArray:
-    """Resolve an ``Rngs``, ``RngStream``, or ``None`` into a fresh PRNG key.
+    """Resolve an ``Rngs``, ``RngStream``, or raw seed/key into a concrete ``JaxArray`` PRNG key.
 
     Args:
-        rngs: Optional ``Rngs`` container, ``RngStream``, or boolean flag.
-        collection: Target stream name (e.g., ``"params"`` or ``"dropout"``).
-        fold_index: Optional deterministic fold-in index used when ``rngs`` is ``None``
-            so multiple parameters initialized without an explicit ``Rngs`` receive
-            distinct deterministic keys.
+        rngs: ``Rngs`` container, ``RngStream`` instance, raw seed/key, or ``None``.
+        collection: Stream name to query when ``rngs`` is an ``Rngs`` instance.
+        fold_index: Deterministic fold-in index used when ``rngs`` is a static key or ``None``.
 
     Returns:
-        Fresh PRNG key ``JaxArray``.
+        2-element ``JaxArray`` PRNG key.
     """
     if isinstance(rngs, Rngs):
         return rngs(collection)
     if isinstance(rngs, RngStream):
         return rngs()
-    base: JaxArray = jrandom.PRNGKey(0)
-    if fold_index is not None:
+    base = _to_prng_key(rngs)
+    tag_hash = _collection_tag_hash(collection)
+    if tag_hash != 0:
+        base = jrandom.fold_in(base, tag_hash)
+    if fold_index > 0:
         folded: JaxArray = jrandom.fold_in(base, fold_index)
         return folded
     return base

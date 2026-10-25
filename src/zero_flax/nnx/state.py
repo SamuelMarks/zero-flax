@@ -1,23 +1,30 @@
-"""Hierarchical State dictionary and Variable exports for the zero-flax NNX API.
+"""Hierarchical State dictionary, Optimizer, and checkpoint helpers for the zero-flax NNX API.
 
-This module implements `State` and `merge` for managing nested dictionaries of
-NNX `Variable` instances (`Param`, `BatchStat`, `Cache`, `Intermediate`, `Rng`,
-and `LoRAParam`) without `Any`, `object`, or reflection.
+This module implements `State`, `merge`, `Optimizer` (backed by `zero-optax`),
+and `save_state` / `restore_state` (backed by `zero-orbax` and validated with
+`zero-chex`) for managing nested dictionaries of NNX `Variable` instances
+(`Param`, `BatchStat`, `Cache`, `Intermediate`, `Rng`, `LoRAParam`, `OptVariable`,
+and `OptState`) without `Any`, `object`, or reflection.
 """
 
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
-from typing import Tuple, Union
+from typing import TYPE_CHECKING, Generic, Optional, Tuple, TypeVar, Union
 
+from ml_switcheroo_compiler.core.tensor import Tensor
 from typing_extensions import TypeAlias
+from zero_jax import numpy as jnp
 
-from zero_flax.nnx.filterlib import Filter, FilterLiteral, to_predicate
+from zero_flax.nnx.filterlib import Filter, FilterLiteral, FilterTarget, to_predicate
 from zero_flax.nnx.variables import (
+    AnyVariable,
     BatchStat,
     Cache,
     Intermediate,
     LoRAParam,
+    OptState,
+    OptVariable,
     Param,
     Rng,
     RngCount,
@@ -25,16 +32,165 @@ from zero_flax.nnx.variables import (
     RngState,
     V,
     Variable,
+    VariableBase,
     VariableValue,
 )
+from zero_flax.types import ArrayProtocol, JaxArray, MetadataValue, ensure_array
 
-StateEntry: TypeAlias = Union[
-    Variable[VariableValue],
-    "State",
+if TYPE_CHECKING:
+    from zero_chex.types import PyTree as ChexPyTree
+    from zero_optax import (
+        GradientTransformation,
+        GradientTransformationExtraArgs,
+    )
+    from zero_optax import (
+        OptState as OptaxOptState,
+    )
+    from zero_optax import (
+        PyTree as OptaxPyTree,
+    )
+    from zero_orbax.types import PathLike
+    from zero_orbax.types import PyTree as OrbaxPyTree
+
+    from zero_flax.nnx.module import Module
+
+LeafStateEntry: TypeAlias = Union[
+    VariableBase,
+    AnyVariable,
     VariableValue,
+]
+StateEntry: TypeAlias = Union[
+    LeafStateEntry,
+    "State",
 ]
 
 FlatPathKey: TypeAlias = Union[str, Tuple[str, ...]]
+PureDictValue: TypeAlias = Union[
+    JaxArray,
+    int,
+    float,
+    bool,
+    str,
+    None,
+    dict[str, "PureDictValue"],
+]
+
+_VARIABLE_SUBCLASSES: dict[str, type[Variable[VariableValue]]] = {
+    "Variable": Variable,
+    "Param": Param,
+    "BatchStat": BatchStat,
+    "Cache": Cache,
+    "Intermediate": Intermediate,
+    "Rng": Rng,
+    "RngState": RngState,
+    "RngKey": RngKey,
+    "LoRAParam": LoRAParam,
+    "OptVariable": OptVariable,
+    "OptState": OptState,
+}
+
+
+def _replace_template_variable(
+    tmpl: AnyVariable,
+    new_val: VariableValue,
+    extra_meta: Optional[Mapping[str, MetadataValue]] = None,
+) -> AnyVariable:
+    """Create a replacement ``Variable`` matching the runtime subclass of ``tmpl``.
+
+    Args:
+        tmpl: Template ``Variable`` instance whose subclass and metadata are preserved.
+        new_val: Replacement variable value.
+        extra_meta: Optional metadata overrides.
+
+    Returns:
+        New ``Variable`` instance of the same runtime subclass.
+    """
+    merged_meta: dict[str, MetadataValue] = dict(tmpl.metadata)
+    if extra_meta is not None:
+        merged_meta.update(extra_meta)
+    if isinstance(tmpl, RngCount):
+        cnt_val = (
+            int(new_val)
+            if isinstance(new_val, (int, float, bool))
+            else (int(jnp.asarray(new_val).item()) if isinstance(new_val, JaxArray) else 0)
+        )
+        return RngCount(cnt_val, **merged_meta)
+    var_cls = _VARIABLE_SUBCLASSES.get(tmpl.var_type, Param)
+    return var_cls(new_val, **merged_meta)
+
+
+def _coerce_leaf_to_variable_value(
+    val: Union[OptaxPyTree, OrbaxPyTree, PureDictValue, StateEntry],
+) -> VariableValue:
+    """Coerce an Optax or Orbax PyTree leaf back into a valid ``VariableValue``.
+
+    Args:
+        val: Candidate leaf value from an Optax update or Orbax checkpoint.
+
+    Returns:
+        Coerced ``VariableValue`` (``JaxArray``, scalar, or ``None``).
+    """
+    if val is None or isinstance(val, (int, float, bool, str)):
+        return val
+    if isinstance(val, Variable):
+        return _coerce_leaf_to_variable_value(val.value)
+    if isinstance(val, JaxArray):
+        return val
+    if isinstance(val, (Tensor, ArrayProtocol)):
+        return ensure_array(val)
+    arr: JaxArray = jnp.asarray(val)
+    return arr
+
+
+def _coerce_metadata_dict(
+    raw_meta: Union[OptaxPyTree, OrbaxPyTree, PureDictValue, StateEntry, None],
+) -> dict[str, MetadataValue]:
+    """Coerce a raw deserialized metadata mapping into a typed ``dict[str, MetadataValue]``.
+
+    Args:
+        raw_meta: Raw metadata dictionary or ``None``.
+
+    Returns:
+        Dictionary of string keys to ``MetadataValue`` entries.
+    """
+    if not isinstance(raw_meta, Mapping):
+        return {}
+    out: dict[str, MetadataValue] = {}
+    for k, v in raw_meta.items():
+        if v is None or isinstance(v, (str, int, float, bool)):
+            out[str(k)] = v
+        elif isinstance(v, (list, tuple)):
+            if all(isinstance(item, int) for item in v):
+                out[str(k)] = tuple(int(item) for item in v if isinstance(item, int))
+            else:
+                out[str(k)] = [str(item) for item in v]
+    return out
+
+
+def _state_to_chex_pytree(state: State) -> dict[str, ChexPyTree]:
+    """Convert a ``State`` into a ``zero_chex``-compatible nested dictionary of arrays/scalars.
+
+    Args:
+        state: Source ``State`` to convert.
+
+    Returns:
+        Nested dictionary with unwrapped array/scalar leaves for ``zero_chex`` assertions.
+    """
+    out: dict[str, ChexPyTree] = {}
+    for k, v in state.items():
+        if isinstance(v, State):
+            out[str(k)] = _state_to_chex_pytree(v)
+        elif isinstance(v, Variable):
+            val = v.value
+            if val is None or isinstance(val, (int, float, bool, str)):
+                out[str(k)] = val
+            else:
+                out[str(k)] = ensure_array(val)
+        elif v is None or isinstance(v, (int, float, bool, str)):
+            out[str(k)] = v
+        else:
+            out[str(k)] = ensure_array(v)
+    return out
 
 
 class State(dict[str, StateEntry]):
@@ -93,9 +249,7 @@ class State(dict[str, StateEntry]):
                     rest[key] = sub_rest
             else:
                 placed = False
-                filter_val: Union[Variable[VariableValue], int, float, str, bool, None] = (
-                    val if isinstance(val, (Variable, int, float, str, bool)) else None
-                )
+                filter_val: FilterTarget = val
                 for idx, pred in enumerate(predicates):
                     if pred(current_path, filter_val):
                         matched_states[idx][key] = val
@@ -116,38 +270,43 @@ class State(dict[str, StateEntry]):
 
         Returns:
             A tuple ``(*matched_states, rest_state)`` of ``State`` instances.
+
+        Raises:
+            ValueError: If no filters are provided to ``split()``.
         """
+        if not filters:
+            raise ValueError("At least one filter must be provided to State.split().")
         predicates = tuple(to_predicate(f) for f in filters)
         matched_states, rest = self._partition_with_predicates(predicates, ())
         return tuple(matched_states) + (rest,)
 
-    def flat_state(self) -> dict[str, Variable[VariableValue]]:
+    def flat_state(self) -> dict[str, LeafStateEntry]:
         """Flatten nested ``State`` dictionaries into a single dot-separated path mapping.
 
         Returns:
-            Dictionary mapping dot-joined paths (e.g., ``"d1.kernel"``) to ``Variable`` leaves.
+            Dictionary mapping dot-joined paths (e.g., ``"d1.kernel"``) to leaf state entries.
         """
-        flat: dict[str, Variable[VariableValue]] = {}
+        flat: dict[str, LeafStateEntry] = {}
         for key, val in self.items():
             if isinstance(val, State):
                 for sub_key, sub_val in val.flat_state().items():
                     flat[f"{key}.{sub_key}"] = sub_val
-            elif isinstance(val, Variable):
+            else:
                 flat[key] = val
         return flat
 
-    def flat_tuple_state(self) -> dict[Tuple[str, ...], Variable[VariableValue]]:
+    def flat_tuple_state(self) -> dict[Tuple[str, ...], LeafStateEntry]:
         """Flatten nested ``State`` dictionaries into a mapping keyed by tuple path segments.
 
         Returns:
-            Dictionary mapping tuple paths (e.g., ``("d1", "kernel")``) to ``Variable`` leaves.
+            Dictionary mapping tuple paths (e.g., ``("d1", "kernel")``) to leaf state entries.
         """
-        flat: dict[Tuple[str, ...], Variable[VariableValue]] = {}
+        flat: dict[Tuple[str, ...], LeafStateEntry] = {}
         for key, val in self.items():
             if isinstance(val, State):
                 for sub_path, sub_val in val.flat_tuple_state().items():
-                    flat[(key, *sub_path)] = sub_val
-            elif isinstance(val, Variable):
+                    flat[(key,) + sub_path] = sub_val
+            else:
                 flat[(key,)] = val
         return flat
 
@@ -155,15 +314,15 @@ class State(dict[str, StateEntry]):
     def from_flat_state(
         cls,
         flat: Union[
-            Mapping[str, Variable[VariableValue]],
-            Mapping[Tuple[str, ...], Variable[VariableValue]],
-            Mapping[FlatPathKey, Variable[VariableValue]],
+            Mapping[str, LeafStateEntry],
+            Mapping[Tuple[str, ...], LeafStateEntry],
+            Mapping[FlatPathKey, LeafStateEntry],
         ],
     ) -> State:
         """Reconstruct a hierarchical ``State`` from a dot-separated or tuple-path dictionary.
 
         Args:
-            flat: Mapping from dot-separated string keys or tuple-of-strings keys to ``Variable`` instances.
+            flat: Mapping from dot-separated string keys or tuple-of-strings keys to leaf entries.
 
         Returns:
             Reconstructed hierarchical ``State``.
@@ -182,6 +341,419 @@ class State(dict[str, StateEntry]):
                     cursor = child
             cursor[parts[-1]] = var
         return root
+
+    def to_optax_tree(self) -> dict[str, OptaxPyTree]:
+        """Convert this ``State`` into a nested dictionary of ``zero_optax`` ``Tensor`` leaves.
+
+        Returns:
+            Nested dictionary mapping state keys to ``ml_switcheroo_compiler.core.tensor.Tensor``
+            or scalar leaves suitable for ``zero_optax`` transformations.
+        """
+        from zero_optax._tree import asarray as optax_asarray
+
+        tree: dict[str, OptaxPyTree] = {}
+        for key, val in self.items():
+            if isinstance(val, State):
+                tree[key] = val.to_optax_tree()
+            elif isinstance(val, Variable):
+                raw_v = val.value
+                if raw_v is None:
+                    tree[key] = None
+                elif isinstance(raw_v, (int, float, bool)):
+                    tree[key] = optax_asarray(raw_v)
+                elif isinstance(raw_v, str):
+                    tree[key] = 0.0
+                else:
+                    tree[key] = optax_asarray(ensure_array(raw_v).tolist())
+            elif val is None or isinstance(val, (int, float, bool)):
+                tree[key] = val if val is None else optax_asarray(val)
+            elif isinstance(val, str):
+                tree[key] = 0.0
+            else:
+                tree[key] = optax_asarray(ensure_array(val).tolist())
+        return tree
+
+    @classmethod
+    def from_optax_tree(
+        cls,
+        tree: Union[Mapping[str, OptaxPyTree], State],
+        template: Optional[State] = None,
+    ) -> State:
+        """Reconstruct a ``State`` from a ``zero_optax`` parameter or update PyTree.
+
+        Preserves exact ``Variable`` subclasses (e.g. ``Param``, ``BatchStat``, ``LoRAParam``)
+        and variable metadata from ``template`` when provided.
+
+        Args:
+            tree: Nested dictionary or ``State`` produced by ``zero_optax``.
+            template: Optional reference ``State`` guiding ``Variable`` type and metadata restoration.
+
+        Returns:
+            Reconstructed ``State`` with ``JaxArray``-backed ``Variable`` leaves.
+        """
+        result = cls()
+        for key, val in tree.items():
+            tmpl_entry = template.get(key) if template is not None else None
+            if isinstance(val, (State, Mapping)):
+                sub_tmpl = tmpl_entry if isinstance(tmpl_entry, State) else None
+                result[key] = cls.from_optax_tree(val, sub_tmpl)
+            else:
+                coerced_val = _coerce_leaf_to_variable_value(val)
+                if isinstance(tmpl_entry, Variable):
+                    target_dt = tmpl_entry.dtype
+                    if (
+                        isinstance(coerced_val, JaxArray)
+                        and target_dt not in ("none", "str")
+                        and str(coerced_val.dtype) != target_dt
+                    ):
+                        coerced_val = ensure_array(coerced_val, dtype=target_dt)
+                    result[key] = _replace_template_variable(tmpl_entry, coerced_val)
+                elif isinstance(val, Variable):
+                    result[key] = _replace_template_variable(val, coerced_val)
+                else:
+                    result[key] = Param(coerced_val)
+        return result
+
+    def to_pure_dict(self, include_variable_metadata: bool = False) -> dict[str, PureDictValue]:
+        """Convert this ``State`` into a pure nested dictionary of arrays and scalars.
+
+        Args:
+            include_variable_metadata: If ``True``, wrap each ``Variable`` leaf in a
+                self-describing dictionary recording ``"__variable_type__"``, ``"value"``,
+                and ``"metadata"``. Defaults to ``False`` (raw values only).
+
+        Returns:
+            Nested ``dict[str, PureDictValue]`` suitable for serialization or inspection.
+        """
+        pure: dict[str, PureDictValue] = {}
+        for key, val in self.items():
+            if isinstance(val, State):
+                pure[key] = val.to_pure_dict(include_variable_metadata=include_variable_metadata)
+            elif isinstance(val, Variable):
+                raw_v = val.value
+                leaf_v: PureDictValue
+                if raw_v is None or isinstance(raw_v, (int, float, bool, str)):
+                    leaf_v = raw_v
+                else:
+                    leaf_v = ensure_array(raw_v)
+                if include_variable_metadata:
+                    meta_dict: dict[str, PureDictValue] = {
+                        str(mk): (
+                            mv if isinstance(mv, (int, float, bool, str)) or mv is None else str(mv)
+                        )
+                        for mk, mv in val.metadata.items()
+                    }
+                    pure[key] = {
+                        "__variable_type__": val.var_type,
+                        "value": leaf_v,
+                        "metadata": meta_dict,
+                    }
+                else:
+                    pure[key] = leaf_v
+            elif val is None or isinstance(val, (int, float, bool, str)):
+                pure[key] = val
+            else:
+                pure[key] = ensure_array(val)
+        return pure
+
+    @classmethod
+    def from_pure_dict(
+        cls,
+        data: Mapping[str, Union[PureDictValue, OrbaxPyTree, StateEntry]],
+        template: Optional[State] = None,
+    ) -> State:
+        """Reconstruct a ``State`` from a pure dictionary or deserialized checkpoint mapping.
+
+        Supports both raw value dictionaries (guided by ``template``) and self-describing
+        dictionaries containing ``"__variable_type__"`` or ``"__zero_flax_variable__"`` tags.
+
+        Args:
+            data: Pure dictionary mapping keys to arrays, scalars, or nested mappings.
+            template: Optional reference ``State`` providing ``Variable`` subclass and metadata templates.
+
+        Returns:
+            Reconstructed ``State`` instance.
+        """
+        result = cls()
+        for key, val in data.items():
+            tmpl_entry = template.get(key) if template is not None else None
+            if isinstance(val, State):
+                sub_tmpl = tmpl_entry if isinstance(tmpl_entry, State) else None
+                result[key] = cls.from_pure_dict(val, sub_tmpl)
+            elif isinstance(val, Variable):
+                coerced_v = _coerce_leaf_to_variable_value(val.value)
+                if isinstance(tmpl_entry, Variable):
+                    result[key] = _replace_template_variable(tmpl_entry, coerced_v, val.metadata)
+                else:
+                    result[key] = _replace_template_variable(val, coerced_v)
+            elif isinstance(val, Mapping):
+                if "__variable_type__" in val or val.get("__zero_flax_variable__") is True:
+                    var_type_name = str(val.get("__variable_type__", val.get("var_type", "Param")))
+                    inner_val = _coerce_leaf_to_variable_value(val.get("value"))
+                    meta = _coerce_metadata_dict(val.get("metadata"))
+                    if isinstance(tmpl_entry, Variable):
+                        result[key] = _replace_template_variable(tmpl_entry, inner_val, meta)
+                    elif var_type_name == "RngCount":
+                        int_val = int(inner_val) if isinstance(inner_val, (int, float, bool)) else 0
+                        result[key] = RngCount(int_val, **meta)
+                    else:
+                        var_cls = _VARIABLE_SUBCLASSES.get(var_type_name, Param)
+                        result[key] = var_cls(inner_val, **meta)
+                else:
+                    raw_entries = (
+                        val.get("entries") if val.get("__zero_flax_state__") is True else val
+                    )
+                    source_map = raw_entries if isinstance(raw_entries, Mapping) else val
+                    sub_tmpl = tmpl_entry if isinstance(tmpl_entry, State) else None
+                    result[key] = cls.from_pure_dict(source_map, sub_tmpl)
+            else:
+                coerced_leaf = _coerce_leaf_to_variable_value(val)
+                if isinstance(tmpl_entry, Variable):
+                    result[key] = _replace_template_variable(tmpl_entry, coerced_leaf)
+                else:
+                    result[key] = Param(coerced_leaf)
+        return result
+
+
+M_opt = TypeVar("M_opt", bound="Module")
+
+
+class Optimizer(Generic[M_opt]):
+    """Stateful NNX optimizer wrapper binding an ``nnx.Module`` and a ``zero_optax`` transformation.
+
+    Tracks the target ``model``, the ``zero_optax`` ``GradientTransformation`` ``tx``,
+    the initialized ``opt_state``, and the integer training ``step`` counter ``OptState[JaxArray]``.
+
+    Attributes:
+        model: Target ``nnx.Module`` whose filtered parameters are optimized.
+        tx: ``zero_optax`` gradient transformation (`GradientTransformation` or `GradientTransformationExtraArgs`).
+        wrt: Variable filter specifying which variables in ``model`` are optimized (defaults to ``Param``).
+        step: ``OptState[JaxArray]`` counter tracking the number of completed ``update()`` steps.
+        opt_state: Current ``zero_optax`` optimizer state (`OptState`).
+        opt_variable: ``OptVariable[State]`` wrapping a snapshot of the filtered parameter state.
+    """
+
+    model: M_opt
+    tx: Union[
+        GradientTransformation[OptaxOptState],
+        GradientTransformationExtraArgs[OptaxOptState],
+    ]
+    wrt: FilterLiteral
+    step: OptState[JaxArray]
+    opt_state: OptaxOptState
+    opt_variable: OptVariable[State]
+
+    def __init__(
+        self,
+        model: M_opt,
+        tx: Union[
+            GradientTransformation[OptaxOptState],
+            GradientTransformationExtraArgs[OptaxOptState],
+        ],
+        wrt: FilterLiteral = Param,
+    ) -> None:
+        """Initialize an ``nnx.Optimizer`` for ``model`` with ``zero_optax`` transformation ``tx``.
+
+        Args:
+            model: ``nnx.Module`` instance to optimize.
+            tx: ``zero_optax`` ``GradientTransformation`` (e.g., ``zero_optax.adamw(1e-3)``).
+            wrt: Filter selecting which variables to optimize. Defaults to ``Param``.
+        """
+        self.model = model
+        self.tx = tx
+        self.wrt = wrt
+        self.step = OptState(jnp.array(0, dtype="int32"))
+        filtered_params = self._extract_params_state()
+        self.opt_variable = OptVariable(filtered_params)
+        self.opt_state = self.tx.init(filtered_params.to_optax_tree())
+
+    def _extract_params_state(self) -> State:
+        """Extract the subset of ``self.model.state()`` matching ``self.wrt``.
+
+        Returns:
+            Filtered ``State`` containing only variables matching ``self.wrt``.
+        """
+        full_state = self.model.state()
+        matched, _ = full_state.split(self.wrt)
+        return matched
+
+    def update(
+        self,
+        grads: Union[State, Mapping[str, StateEntry]],
+        **extra_args: Union[float, int, str, bool, Tensor, None],
+    ) -> None:
+        """Apply one optimization step to ``self.model`` using ``grads`` and ``self.tx``.
+
+        Validates that ``grads`` matches the structure and tensor shapes of the filtered
+        model parameters via ``zero_chex.assert_trees_all_equal_shapes``, transforms
+        ``grads`` via ``self.tx.update``, applies the updates via ``zero_optax.apply_updates``,
+        updates ``self.model`` in-place, and increments ``self.step``.
+
+        Args:
+            grads: Gradient ``State`` (or nested mapping) matching the filtered parameters of ``self.model``.
+            **extra_args: Optional extra keyword arguments forwarded to ``GradientTransformationExtraArgs.update``.
+        """
+        import zero_chex
+        import zero_optax
+        from zero_optax import GradientTransformationExtraArgs as RuntimeExtraArgs
+
+        grads_state = grads if isinstance(grads, State) else State(grads)
+        params_state = self._extract_params_state()
+        zero_chex.assert_trees_all_equal_structs(
+            _state_to_chex_pytree(params_state),
+            _state_to_chex_pytree(grads_state),
+        )
+        zero_chex.assert_trees_all_equal_shapes(
+            _state_to_chex_pytree(params_state),
+            _state_to_chex_pytree(grads_state),
+        )
+
+        params_optax = params_state.to_optax_tree()
+        grads_optax = grads_state.to_optax_tree()
+        if isinstance(self.tx, RuntimeExtraArgs) and extra_args:
+            updates_optax, new_opt_state = self.tx.update(
+                grads_optax,
+                self.opt_state,
+                params_optax,
+                **extra_args,
+            )
+        else:
+            updates_optax, new_opt_state = self.tx.update(
+                grads_optax,
+                self.opt_state,
+                params_optax,
+            )
+        new_params_optax = zero_optax.apply_updates(params_optax, updates_optax)
+        updated_state = (
+            State.from_optax_tree(new_params_optax, template=params_state)
+            if isinstance(new_params_optax, Mapping)
+            else params_state
+        )
+        self.model.update(updated_state)
+        self.opt_variable = OptVariable(updated_state)
+        self.opt_state = new_opt_state
+        cur_step = int(jnp.asarray(self.step.value).item())
+        self.step = OptState(jnp.array(cur_step + 1, dtype="int32"))
+
+    def state_dict(self) -> dict[str, OrbaxPyTree]:
+        """Serialize the optimizer's model parameters, step counter, and ``opt_state`` for checkpointing.
+
+        Returns:
+            Dictionary containing ``"model_state"``, ``"step"``, and ``"opt_state"`` ready for
+            ``zero_orbax`` checkpoint handlers.
+        """
+        from zero_optax.base import opt_state_to_state_dict
+
+        return {
+            "model_state": self.model.state().to_pure_dict(include_variable_metadata=True),
+            "step": int(jnp.asarray(self.step.value).item()),
+            "opt_state": opt_state_to_state_dict(self.opt_state),
+        }
+
+    def load_state_dict(
+        self,
+        state_dict: Mapping[str, Union[OrbaxPyTree, State]],
+    ) -> None:
+        """Restore the optimizer's model parameters, step counter, and ``opt_state`` from ``state_dict``.
+
+        Args:
+            state_dict: Deserialized dictionary produced by ``state_dict()`` or ``zero_orbax``.
+        """
+        from zero_optax.base import opt_state_from_state_dict
+
+        raw_model_state = state_dict.get("model_state")
+        if isinstance(raw_model_state, State):
+            restored_model_state = raw_model_state
+        elif isinstance(raw_model_state, Mapping):
+            restored_model_state = State.from_pure_dict(
+                raw_model_state, template=self.model.state()
+            )
+        else:
+            restored_model_state = self.model.state()
+        self.model.update(restored_model_state)
+        self.opt_variable = OptVariable(self._extract_params_state())
+
+        raw_step = state_dict.get("step", 0)
+        step_int = int(raw_step) if isinstance(raw_step, (int, float, bool)) else 0
+        self.step = OptState(jnp.array(step_int, dtype="int32"))
+
+        raw_opt_state = state_dict.get("opt_state")
+        if raw_opt_state is not None:
+            self.opt_state = opt_state_from_state_dict(self.opt_state, raw_opt_state)
+
+
+def save_state(
+    directory: PathLike,
+    state: State,
+    *,
+    force: bool = True,
+) -> bool:
+    """Save an ``nnx.State`` to ``directory`` using ``zero_orbax.checkpoint.PyTreeCheckpointer``.
+
+    Args:
+        directory: Target local path or virtual URI (e.g., ``"memory://ckpt"``).
+        state: ``State`` container to serialize.
+        force: Whether to overwrite an existing checkpoint directory. Defaults to ``True``.
+
+    Returns:
+        ``True`` when the checkpoint has been committed.
+    """
+    import zero_orbax.checkpoint as ocp
+
+    checkpointer = ocp.PyTreeCheckpointer()
+    checkpointer.save(
+        directory,
+        state.to_pure_dict(include_variable_metadata=True),
+        force=force,
+    )
+    return True
+
+
+def restore_state(
+    directory: PathLike,
+    target: Optional[State] = None,
+) -> State:
+    """Restore an ``nnx.State`` from ``directory`` using ``zero_orbax.checkpoint.PyTreeCheckpointer``.
+
+    Validates structural and shape equality against ``target`` via ``zero_chex`` when
+    ``target`` is provided.
+
+    Args:
+        directory: Source local path or virtual URI (e.g., ``"memory://ckpt"``).
+        target: Optional reference ``State`` template to guide restoration and update in-place.
+
+    Returns:
+        Restored ``State`` instance.
+    """
+    import zero_chex
+    import zero_orbax.checkpoint as ocp
+
+    checkpointer = ocp.PyTreeCheckpointer()
+    target_item = (
+        target.to_pure_dict(include_variable_metadata=True) if target is not None else None
+    )
+    restored = checkpointer.restore(directory, item=target_item)
+    result_state = (
+        restored
+        if isinstance(restored, State)
+        else (
+            State.from_pure_dict(restored, template=target)
+            if isinstance(restored, Mapping)
+            else State()
+        )
+    )
+    if target is not None:
+        ordered_result = State({k: result_state[k] for k in target if k in result_state})
+        zero_chex.assert_trees_all_equal_structs(
+            _state_to_chex_pytree(ordered_result),
+            _state_to_chex_pytree(target),
+        )
+        zero_chex.assert_trees_all_equal_shapes(
+            _state_to_chex_pytree(ordered_result),
+            _state_to_chex_pytree(target),
+        )
+        return ordered_result
+    return result_state
 
 
 def merge(*states: State) -> State:
@@ -208,12 +780,18 @@ def merge(*states: State) -> State:
 
 
 __all__ = [
+    "AnyVariable",
     "BatchStat",
     "Cache",
     "FlatPathKey",
     "Intermediate",
+    "LeafStateEntry",
     "LoRAParam",
+    "OptState",
+    "OptVariable",
+    "Optimizer",
     "Param",
+    "PureDictValue",
     "Rng",
     "RngCount",
     "RngKey",
@@ -222,6 +800,9 @@ __all__ = [
     "StateEntry",
     "V",
     "Variable",
+    "VariableBase",
     "VariableValue",
     "merge",
+    "restore_state",
+    "save_state",
 ]

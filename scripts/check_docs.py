@@ -54,7 +54,12 @@ def _is_overload(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
     Returns:
         ``True`` if decorated with ``overload``, else ``False``.
     """
-    return any(isinstance(dec, ast.Name) and dec.id == "overload" for dec in node.decorator_list)
+    for dec in node.decorator_list:
+        if isinstance(dec, ast.Name) and dec.id == "overload":
+            return True
+        if isinstance(dec, ast.Attribute) and dec.attr == "overload":
+            return True
+    return False
 
 
 def _returns_none(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
@@ -91,6 +96,26 @@ def _has_direct_raise(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
             return True
         stack.extend(ast.iter_child_nodes(cur))
     return False
+
+
+def _extract_args_section(docstring: str) -> str:
+    """Extract the ``Args:`` block from a Google-style ``docstring``.
+
+    Args:
+        docstring: Complete function or method docstring.
+
+    Returns:
+        Substring starting at ``Args:`` up to the next top-level section header or end of string.
+    """
+    idx = docstring.find("Args:")
+    if idx == -1:
+        return ""
+    after_args = docstring[idx + len("Args:") :]
+    nl = chr(10)
+    next_sec = re.search(nl + r"\s*(Returns|Yields|Raises|Attributes|Note|Notes):", after_args)
+    if next_sec is not None:
+        return after_args[: next_sec.start()]
+    return after_args
 
 
 def check_file(filepath: str) -> list[str]:
@@ -148,14 +173,15 @@ def check_file(filepath: str) -> list[str]:
                 param_names.append(node.args.kwarg.arg)
 
             if param_names:
-                if "Args:" not in fn_doc:
+                args_section = _extract_args_section(fn_doc)
+                if not args_section:
                     violations.append(
                         f"{filepath}:{node.lineno}: function '{node.name}' missing 'Args:' section in docstring"
                     )
                 else:
                     for p_name in param_names:
                         pattern = rf"\b{re.escape(p_name)}\b"
-                        if not re.search(pattern, fn_doc):
+                        if not re.search(pattern, args_section):
                             violations.append(
                                 f"{filepath}:{node.lineno}: parameter '{p_name}' not documented in '{node.name}' docstring"
                             )

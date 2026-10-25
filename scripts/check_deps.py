@@ -54,7 +54,9 @@ def is_stdlib(module_name: str) -> bool:
     if spec is None or spec.origin is None:
         return False
     stdlib_path = sysconfig.get_path("stdlib") or ""
-    return spec.origin.startswith(stdlib_path) and "site-packages" not in spec.origin
+    return spec.origin in ("built-in", "frozen") or (
+        spec.origin.startswith(stdlib_path) and "site-packages" not in spec.origin
+    )
 
 
 def collect_src_files(paths: Sequence[str]) -> list[str]:

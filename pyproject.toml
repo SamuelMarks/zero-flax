@@ -56,7 +56,16 @@ ignore = ["E501", "UP006", "UP007", "UP035", "UP045", "ANN401", "D418"]
 convention = "google"
 
 [tool.pytest.ini_options]
-pythonpath = ["src"]
+pythonpath = [
+    "src",
+    "../zero-chex/src",
+    "../zero-grain/src",
+    "../zero-optax/src",
+    "../zero-orbax/src",
+    "../zero-jax/src",
+    "../ml-switcheroo-ir/src",
+    "../ml-switcheroo-compiler/src",
+]
 addopts = "--cov=src/zero_flax --cov=scripts --cov-branch --cov-report=term-missing --cov-fail-under=100"
 
 [tool.coverage.run]
@@ -85,8 +94,16 @@ verbose = 2
 exclude = ["build", "dist", ".git", ".venv"]
 
 [tool.mypy]
-python_version = "3.9"
-mypy_path = "src"
+python_version = "3.10"
+mypy_path = [
+    "src",
+    "../zero-chex/src",
+    "../zero-grain/src",
+    "../zero-optax/src",
+    "../zero-orbax/src",
+    "../ml-switcheroo-ir/src",
+    "../ml-switcheroo-compiler/src",
+]
 files = ["src", "scripts", "tests"]
 strict = true
 ignore_missing_imports = true

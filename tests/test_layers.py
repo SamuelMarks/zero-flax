@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
+import zero_chex
 from zero_jax.nn import initializers
 
 import zero_flax.nnx as nnx
@@ -267,3 +269,53 @@ def test_nn_activations_reexport() -> None:
 
     var = variables.Variable(5)
     assert var.value == 5
+    assert var.shape == ()
+    assert var.dtype == "int32"
+    assert var.var_type == "Variable"
+
+    var_none = variables.Variable(None)
+    assert var_none.shape == ()
+    assert var_none.dtype == "none"
+
+    var_bool = variables.Variable(True)
+    assert var_bool.dtype == "bool"
+
+    var_float = variables.Variable(1.5)
+    assert var_float.dtype == "float32"
+
+    var_str = variables.Variable("tag")
+    assert var_str.dtype == "str"
+
+
+def test_chex_layer_and_variable_assertions() -> None:
+    """Verify zero-chex assertions on Variables, State, and layer forward passes."""
+    lin = nnx.Linear(3, 2)
+    zero_chex.assert_shape(lin.kernel, (3, 2))
+    zero_chex.assert_type(lin.kernel, {"float32", "float64"})
+    zero_chex.assert_trees_all_equal_shapes(lin.state(), lin.state())
+
+    lora = nnx.LoRA(3, 2, 4)
+    out_lora = lora(np.ones((2, 3), dtype=np.float32))
+    zero_chex.assert_shape(out_lora, (2, 4))
+    with pytest.raises(ValueError, match="LoRA input last dimension"):
+        lora(np.ones((2, 5), dtype=np.float32))
+
+    cell = nnx.SimpleCell(3, 4)
+    carry = cell.initialize_carry((2, 3))
+    with pytest.raises(AssertionError):
+        cell(carry, np.ones((2, 5), dtype=np.float32))
+    with pytest.raises(AssertionError):
+        cell(np.ones((2, 6), dtype=np.float32), np.ones((2, 3), dtype=np.float32))
+
+    gru = nnx.GRUCell(3, 4)
+    with pytest.raises(AssertionError):
+        gru(carry, np.ones((2, 5), dtype=np.float32))
+
+    lstm = nnx.LSTMCell(3, 4)
+    lstm_carry = lstm.initialize_carry((2, 3))
+    with pytest.raises(AssertionError):
+        lstm(lstm_carry, np.ones((2, 5), dtype=np.float32))
+
+    opt_lstm = nnx.OptimizedLSTMCell(3, 4)
+    with pytest.raises(AssertionError):
+        opt_lstm(lstm_carry, np.ones((2, 5), dtype=np.float32))

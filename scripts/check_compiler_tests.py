@@ -50,17 +50,49 @@ REQUIRED_NNX_LAYERS: tuple[str, ...] = (
     "WeightNorm",
 )
 
+VALUE_ASSERT_CALL_NAMES: frozenset[str] = frozenset(
+    {
+        "assert_allclose",
+        "assert_array_equal",
+        "assert_array_almost_equal",
+        "assert_equal",
+    }
+)
+
+
+def _is_shape_only_assert(assert_node: ast.Assert) -> bool:
+    """Check whether an ``ast.Assert`` statement only inspects ``.shape``.
+
+    Args:
+        assert_node: AST ``Assert`` node to inspect.
+
+    Returns:
+        ``True`` if the assertion compares ``.shape`` without checking values.
+    """
+    test_expr = assert_node.test
+    if isinstance(test_expr, ast.Compare) and isinstance(test_expr.left, ast.Attribute):
+        return test_expr.left.attr == "shape"
+    return False
+
 
 def _has_value_assertion(fn_node: ast.FunctionDef) -> bool:
-    """Check whether ``fn_node`` contains at least one ``assert`` or ``assert_allclose`` check.
+    """Check whether ``fn_node`` contains at least one non-shape value assertion or ``assert_allclose`` call.
 
     Args:
         fn_node: AST ``FunctionDef`` node of a test function.
 
     Returns:
-        ``True`` if ``fn_node`` performs at least one assertion, else ``False``.
+        ``True`` if ``fn_node`` performs at least one value assertion, else ``False``.
     """
-    return any(isinstance(sub, (ast.Assert, ast.Call)) for sub in ast.walk(fn_node))
+    for sub in ast.walk(fn_node):
+        if isinstance(sub, ast.Assert) and not _is_shape_only_assert(sub):
+            return True
+        if isinstance(sub, ast.Call):
+            if isinstance(sub.func, ast.Name) and sub.func.id in VALUE_ASSERT_CALL_NAMES:
+                return True
+            if isinstance(sub.func, ast.Attribute) and sub.func.attr in VALUE_ASSERT_CALL_NAMES:
+                return True
+    return False
 
 
 def check_parity_file(parity_test_path: str = "tests/test_parity_flax.py") -> list[str]:

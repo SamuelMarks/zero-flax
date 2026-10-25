@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 
 import numpy as np
@@ -9,6 +10,7 @@ import pytest
 from ml_switcheroo_compiler.core.dtype import DType as CompilerDType
 from ml_switcheroo_compiler.core.tensor import Tensor, TensorConfig
 from zero_jax import numpy as jnp
+from zero_jax.nn import initializers
 
 import zero_flax.nnx as nnx
 from zero_flax.nnx import filterlib, rnglib
@@ -39,21 +41,34 @@ from zero_flax.types import (
 
 
 def test_rnglib_branches() -> None:
-    """Verify RngStream and Rngs edge cases including fork, fallback stream creation, and KeyError."""
+    """Verify RngStream and Rngs edge cases including fork, fallback stream tag hashing, and KeyError."""
     stream = rnglib.RngStream(None, tag="custom")
     stream_arr = rnglib.RngStream((0, 0), tag="tuple_key")
+    stream_scalar = rnglib.RngStream(jnp.asarray(7), tag="scalar_key")
     assert stream_arr() is not None
+    assert stream_scalar() is not None
     assert stream.fork() is not None
     assert stream.fork(2).shape[0] == 2
     assert stream.fork((2, 3)).shape == (2, 3, 2)
 
+    r_default = rnglib.Rngs(0)
+    assert r_default.carry() is not None
+    assert r_default("default") is not None
+    assert r_default.fork(2).shape[0] == 2
+    r_with_substream = rnglib.Rngs(0, custom=rnglib.RngStream(7, tag="custom"))
+    assert r_with_substream["custom"] is not None
+    k_p = np.asarray(rnglib.Rngs(0)("params"))
+    k_d = np.asarray(rnglib.Rngs(0)("dropout"))
+    assert not np.array_equal(k_p, k_d)
+
     rngs_no_default = rnglib.Rngs(default=None, params=42)
-    assert rngs_no_default.has_stream("params")
-    assert not rngs_no_default.has_stream("missing")
-    with pytest.raises(KeyError, match="No RNG stream found"):
+    assert rngs_no_default["params"] is not None
+    assert rngs_no_default.fork() is not None
+    with pytest.raises(KeyError, match="No RNG stream"):
         rngs_no_default("new_stream")
     assert rnglib.resolve_rng_key(stream) is not None
     assert rnglib.resolve_rng_key(True) is not None
+    assert rnglib.resolve_rng_key(0, collection="default", fold_index=0) is not None
 
 
 def test_filterlib_and_state_branches() -> None:
@@ -72,6 +87,8 @@ def test_filterlib_and_state_branches() -> None:
 
     st_kw = nnx.State(a=nnx.Param(1))
     assert "a" in st_kw
+    with pytest.raises(ValueError, match="At least one filter"):
+        st_kw.split()
 
     st = nnx.State(
         {
@@ -97,10 +114,12 @@ def test_filterlib_and_state_branches() -> None:
     assert "d1.bias" in flat
     assert "d1.sub.leaf" in flat
     assert "top" in flat
+    assert flat["raw_int"] == 99
 
     flat_tuples = st.flat_tuple_state()
     assert ("d1", "kernel") in flat_tuples
     assert ("top",) in flat_tuples
+    assert flat_tuples[("raw_int",)] == 99
 
     reconstructed = nnx.State.from_flat_state(flat)
     assert isinstance(reconstructed["d1"], nnx.State)
@@ -150,6 +169,8 @@ def test_types_and_conv_branches() -> None:
         sanitize_dtype_str(Dtype("invalid_dt"))
     with pytest.raises(ValueError, match="Unsupported dtype string"):
         sanitize_dtype_str("invalid_dt")
+    with pytest.raises(ValueError, match="Unsupported dtype string"):
+        sanitize_dtype_str(str)
 
     axes_single = nnx.Axes(-1)
     assert tuple(axes_single) == (-1,)
@@ -160,6 +181,13 @@ def test_types_and_conv_branches() -> None:
     assert ensure_array([1.0, 2.0], dtype="float32").shape == (2,)
     promoted = default_promote_dtype(None, [1, 2], inexact=True)
     assert len(promoted) == 2
+    promoted_inexact_false = default_promote_dtype([1, 2], inexact=False)
+    assert len(promoted_inexact_false) == 1
+    promoted_mixed = default_promote_dtype(
+        np.array([1.0], dtype=np.float32),
+        np.array([2.0], dtype=np.float64),
+    )
+    assert len(promoted_mixed) == 2
     promoted_typed = default_promote_dtype([1.0, 2.0], dtype="float32")
     assert len(promoted_typed) == 1
 
@@ -206,26 +234,27 @@ def test_types_and_conv_branches() -> None:
     assert resolve_initializer(_two_arg_init)((0, 0), (2, 2), dt).shape == (2, 2)
     assert resolve_initializer(_three_arg_init)((0, 0), (2, 2), dt).shape == (2, 2)
 
-    for act_name in (
-        "sigmoid",
-        "tanh",
-        "relu",
-        "gelu",
-        "silu",
-        "elu",
-        "celu",
-        "selu",
-        "softplus",
-        "soft_sign",
-        "hard_tanh",
-        "hard_sigmoid",
-        "hard_swish",
-        "leaky_relu",
-        "log_sigmoid",
-        "relu6",
-    ):
+    expected_activations: dict[str, float] = {
+        "sigmoid": 1.0 / (1.0 + math.exp(-0.5)),
+        "tanh": math.tanh(0.5),
+        "relu": 0.5,
+        "gelu": float(np.asarray(nnx.gelu(0.5))),
+        "silu": 0.5 / (1.0 + math.exp(-0.5)),
+        "elu": 0.5,
+        "celu": 0.5,
+        "selu": float(np.asarray(nnx.selu(0.5))),
+        "softplus": math.log(1.0 + math.exp(0.5)),
+        "soft_sign": 0.5 / 1.5,
+        "hard_tanh": 0.5,
+        "hard_sigmoid": float(np.asarray(nnx.hard_sigmoid(0.5))),
+        "hard_swish": float(np.asarray(nnx.hard_swish(0.5))),
+        "leaky_relu": 0.5,
+        "log_sigmoid": -math.log(1.0 + math.exp(-0.5)),
+        "relu6": 0.5,
+    }
+    for act_name, exp_val in expected_activations.items():
         act_fn = resolve_activation(act_name)
-        assert act_fn(0.5) is not None
+        np.testing.assert_allclose(float(np.asarray(act_fn(0.5))), exp_val, rtol=1e-5, atol=1e-5)
 
     with pytest.raises(ValueError, match="Unsupported activation"):
         resolve_activation("unknown_act")
@@ -268,7 +297,9 @@ def test_types_and_conv_branches() -> None:
     assert ll_extra._static_config["custom_flag"] is True
     assert ll_extra(np.ones((1, 2), dtype=np.float32)).shape == (1, 2)
 
-    lora_with_base = nnx.LoRA(2, 1, 2, base_module=nnx.Linear(2, 2), promote_dtype=None)
+    lora_with_base = nnx.LoRA(
+        2, 1, 2, precision="high", base_module=nnx.Linear(2, 2), promote_dtype=None
+    )
     assert lora_with_base(np.ones((1, 2), dtype=np.float32)).shape == (1, 2)
 
     with pytest.raises(ValueError, match="feature_group_count must be a positive"):
@@ -288,10 +319,24 @@ def test_types_and_conv_branches() -> None:
         mask=mask,
         preferred_element_type="float32",
         promote_dtype=None,
+        dtype="float32",
+        kernel_init=initializers.ones,
+        bias_init=initializers.zeros,
     )
-    assert c_causal(np.ones((1, 4, 2), dtype=np.float32)).shape == (1, 4, 2)
+    causal_out = np.asarray(c_causal(np.ones((1, 4, 2), dtype=np.float32)))
+    assert causal_out.shape == (1, 4, 2)
+    np.testing.assert_allclose(causal_out[0, 0], np.array([1.0, 1.0], dtype=np.float32))
+    np.testing.assert_allclose(causal_out[0, 1], np.array([2.0, 2.0], dtype=np.float32))
 
-    c_circ = nnx.Conv(2, 2, kernel_size=(3, 3), padding="CIRCULAR", input_dilation=(1, 2))
+    c_circ = nnx.Conv(
+        2,
+        2,
+        kernel_size=(3, 3),
+        padding="CIRCULAR",
+        input_dilation=(1, 2),
+        kernel_init=initializers.ones,
+        bias_init=initializers.zeros,
+    )
     assert c_circ(np.ones((1, 3, 3, 2), dtype=np.float32)).shape == (1, 3, 5, 2)
     assert c_circ(np.ones((1, 1, 1, 2), dtype=np.float32)).shape == (1, 1, 1, 2)
 
@@ -342,6 +387,7 @@ def test_types_and_conv_branches() -> None:
         transpose_kernel=True,
         preferred_element_type="float32",
         promote_dtype=None,
+        dtype="float32",
     )
     assert ct_valid(np.ones((1, 3, 2), dtype=np.float32)).shape == (1, 4, 2)
     with pytest.raises(ValueError, match="ConvTranspose expects input"):
@@ -362,28 +408,46 @@ def test_transforms_and_module_edge_branches() -> None:
     ein_custom = nnx.Einsum(
         "ab,bc->ac",
         (2, 2),
+        bias_shape=(1, 2),
         einsum_op=lambda eq, a, b: jnp.einsum(eq, a, b),
     )
     assert ein_custom(np.ones((1, 2), dtype=np.float32)).shape == (1, 2)
+
+    lg_batch_1 = nnx.LinearGeneral(
+        3,
+        4,
+        axis=-1,
+        batch_axis=[0],
+        use_bias=False,
+        kernel_init=initializers.ones,
+    )
+    assert lg_batch_1(np.ones((1, 3), dtype=np.float32)).shape == (1, 4)
 
     lora_plain = nnx.LoRA(2, 1, 2)
     assert lora_plain(np.ones((1, 2), dtype=np.float32)).shape == (1, 2)
 
     m = nnx.Module()
     m.register_variable("0", nnx.Param(1))
-    m.update(
-        nnx.State({"0": nnx.Param(2)}),
-        nnx.State({"new_var": nnx.Param(5)}),
-    )
-    assert m._variables["new_var"].value == 5
+    m.update(nnx.State({"0": nnx.Param(2)}), nnx.State({"0": nnx.Param(3)}))
+    assert m._variables["0"].value == 3
+    d_dyn: nnx.Dict[nnx.Param[int]] = nnx.Dict()
+    d_dyn.update(nnx.State({"dyn_p": nnx.Param(11)}))
+    assert d_dyn._variables["dyn_p"].value == 11
+    with pytest.raises(KeyError, match="Unknown variable key"):
+        m.update(nnx.State({"new_var": nnx.Param(5)}))
+    with pytest.raises(KeyError, match="Unknown state key"):
+        m.update(nnx.State({"unknown_static": 5}))
+    m.register_static("cfg", 1)
+    with pytest.raises(KeyError, match="Unsupported static config value"):
+        m.update(nnx.State({"cfg": np.ones((2,))}))
     with pytest.raises(KeyError, match="Unknown child module key"):
         m.update(nnx.State({"sub": nnx.State({"x": 1})}))
 
     gdef, _ = nnx.split(m)
     m_empty_merge = nnx.merge(gdef)
     assert isinstance(m_empty_merge, nnx.Module)
-    m_seq_merge = nnx.merge(gdef, [nnx.State({"new_var": nnx.Param(7)})])
-    assert m_seq_merge._variables["new_var"].value == 7
+    m_seq_merge = nnx.merge(gdef, [nnx.State({"0": nnx.Param(7)})])
+    assert m_seq_merge._variables["0"].value == 7
     s_seq_merge = nnx.merge(nnx.State({"a": 1}), [nnx.State({"b": 2})])
     assert s_seq_merge["b"] == 2
 
@@ -489,8 +553,8 @@ def test_transforms_and_module_edge_branches() -> None:
         """
         return nnx.Module()
 
-    j_cls_default = nnx.Jit(nnx.Linear)
-    assert np.asarray(j_cls_default(np.ones((1, 1), dtype=np.float32))).shape == (1, 1)
+    with pytest.raises(TypeError, match="requires 2 positional initialization"):
+        nnx.Jit(nnx.Linear)
     j_cls_opt = nnx.Jit(nnx.RoPE)
     assert np.asarray(j_cls_opt(np.ones((1, 2, 4), dtype=np.float32))).shape == (1, 2, 4)
     j_cls_args = nnx.Jit(nnx.Linear, module_init_args=(2, 3))
@@ -505,47 +569,76 @@ def test_transforms_and_module_edge_branches() -> None:
     j_non_mod_init = nnx.Jit(_double_fn, module_init_args=(1,))
     assert float(np.asarray(j_non_mod_init(3.0))) == 6.0
     j_ret_mod = nnx.Jit(_ret_mod_fn)
-    assert np.asarray(j_ret_mod(1.0)).shape == (0,)
+    with pytest.raises(TypeError, match="returned a Module"):
+        j_ret_mod(1.0)
     j_inactive = nnx.Jit(nnx.Module())
-    assert float(np.asarray(j_inactive(5.0))) == 5.0
-    assert np.asarray(j_inactive()).shape == (0,)
+    with pytest.raises(TypeError, match="not callable"):
+        j_inactive(5.0)
     r_fn = nnx.Remat(_double_fn)
     assert float(np.asarray(r_fn(3.0))) == 6.0
 
     seq_inactive = nnx.Sequential(nnx.Module())
-    assert seq_inactive(4.0) == 4.0
+    with pytest.raises(TypeError, match="not callable"):
+        seq_inactive(4.0)
 
-    gn_2d = nnx.GroupNorm(num_features=4, num_groups=2)
+    gn_2d = nnx.GroupNorm(num_features=4, num_groups=2, use_scale=False, use_bias=False)
     assert gn_2d(np.ones((2, 4), dtype=np.float32)).shape == (2, 4)
+    in_no_sb = nnx.InstanceNorm(num_features=2, use_scale=False, use_bias=False)
+    assert in_no_sb(np.ones((1, 2, 2), dtype=np.float32)).shape == (1, 2, 2)
+    wn_no_s_prom = nnx.WeightNorm(nnx.Linear(2, 2), use_scale=False)
+    assert wn_no_s_prom(np.ones((1, 2), dtype=np.float32)).shape == (1, 2)
 
     v_fn = nnx.Vmap(_double_fn)
     assert float(np.asarray(v_fn())) == 0.0
     assert float(np.asarray(v_fn(3.0))) == 6.0
     assert np.asarray(v_fn(np.ones((2, 2), dtype=np.float32), 1.0)).shape == (2, 2)
+    with pytest.raises(ValueError, match="inconsistent batch axis sizes"):
+        v_fn(np.ones((2, 2), dtype=np.float32), np.ones((3, 2), dtype=np.float32))
 
-    v_seq_axes = nnx.Vmap(_double_fn, in_axes=(0, None), out_axes=0)
+    v_seq_axes = nnx.Vmap(_double_fn, in_axes=(0, None), out_axes=None)
     assert np.asarray(
         v_seq_axes(
             np.ones((2, 2), dtype=np.float32),
             np.ones((2,), dtype=np.float32),
             np.ones((2, 2), dtype=np.float32),
         )
-    ).shape == (2, 2)
+    ).shape == (2,)
 
     v_none_axes = nnx.Vmap(_double_fn, in_axes=None, axis_size=2)
     assert np.asarray(v_none_axes(np.ones((2,), dtype=np.float32))).shape == (2, 2)
 
-    v_tuple = nnx.Vmap(_tuple_fn, in_axes=0, out_axes=(0, 0))
+    v_tuple = nnx.Vmap(_tuple_fn, in_axes=0, out_axes=(0, None))
     vt_res = v_tuple(np.ones((2, 3), dtype=np.float32))
-    assert isinstance(vt_res, tuple) and vt_res[0].shape == (2, 3)
+    assert isinstance(vt_res, tuple) and vt_res[0].shape == (2, 3) and vt_res[1].shape == (3,)
 
-    s_single = nnx.Scan(_inc_fn, in_axes=0, out_axes=0, reverse=True)
+    s_single = nnx.Scan(
+        _inc_fn,
+        in_axes=0,
+        out_axes=0,
+        reverse=True,
+        data_transform=_double_fn,
+    )
     assert float(np.asarray(s_single())) == 1.0
     assert np.asarray(s_single(np.ones((3, 2), dtype=np.float32))).shape == (3, 2)
+    assert np.asarray(s_single(np.zeros((0, 2), dtype=np.float32))).shape == (0, 2)
 
-    s_carry_only = nnx.Scan(_one_arg_fn, in_axes=0, out_axes=0, scan_output=False)
+    s_carry_only = nnx.Scan(
+        _one_arg_fn,
+        in_axes=0,
+        out_axes=0,
+        scan_output=False,
+        data_transform=_double_fn,
+    )
     c_final = s_carry_only(np.zeros((2,), dtype=np.float32), np.ones((3, 2), dtype=np.float32))
     assert np.asarray(c_final).shape == (2,)
+    c_empty = s_carry_only(np.zeros((2,), dtype=np.float32), np.zeros((0, 2), dtype=np.float32))
+    assert np.asarray(c_empty).shape == (2,)
+
+    s_empty_with_out = nnx.Scan(_one_arg_fn, in_axes=0, out_axes=0, scan_output=True)
+    c_eo, y_eo = s_empty_with_out(
+        np.zeros((2,), dtype=np.float32), np.zeros((0, 2), dtype=np.float32)
+    )
+    assert np.asarray(c_eo).shape == (2,) and np.asarray(y_eo).shape == (0, 2)
 
     s_ret_mod = nnx.Scan(_ret_mod_fn, in_axes=0, out_axes=0)
     res_ret_mod = s_ret_mod(np.zeros((2,)), np.ones((2, 2)))
@@ -555,7 +648,16 @@ def test_transforms_and_module_edge_branches() -> None:
     res_inactive = s_inactive(np.zeros((2,)), np.ones((2, 2)))
     assert isinstance(res_inactive, tuple) and res_inactive[1].shape == (2, 2)
 
-    p_fn = nnx.Pmap(_inc_fn)
+    p_fn = nnx.Pmap(_inc_fn, static_broadcasted_argnums=(1,))
     assert float(np.asarray(p_fn())) == 1.0
     assert float(np.asarray(p_fn(2.0))) == 3.0
-    assert np.asarray(p_fn(np.ones((2, 2), dtype=np.float32), 1.0)).shape == (2, 2)
+    assert np.asarray(
+        p_fn(np.ones((2, 2), dtype=np.float32), np.ones((2,), dtype=np.float32))
+    ).shape == (
+        2,
+        2,
+    )
+    p_all_bcast = nnx.Pmap(_inc_fn, static_broadcasted_argnums=(0,))
+    assert np.asarray(p_all_bcast(np.ones((2,), dtype=np.float32))).shape == (2,)
+    p_axis_sz = nnx.Pmap(_inc_fn, axis_size=2, static_broadcasted_argnums=(0,))
+    assert np.asarray(p_axis_sz(np.ones((3,), dtype=np.float32))).shape == (2, 3)

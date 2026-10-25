@@ -233,6 +233,15 @@ from zero_flax.nnx.state import (
     LoRAParam as LoRAParam,
 )
 from zero_flax.nnx.state import (
+    Optimizer as Optimizer,
+)
+from zero_flax.nnx.state import (
+    OptState as OptState,
+)
+from zero_flax.nnx.state import (
+    OptVariable as OptVariable,
+)
+from zero_flax.nnx.state import (
     Param as Param,
 )
 from zero_flax.nnx.state import (
@@ -252,6 +261,12 @@ from zero_flax.nnx.state import (
 )
 from zero_flax.nnx.state import (
     Variable as Variable,
+)
+from zero_flax.nnx.state import (
+    restore_state as restore_state,
+)
+from zero_flax.nnx.state import (
+    save_state as save_state,
 )
 from zero_flax.nnx.stochastic import Dropout as Dropout
 from zero_flax.nnx.transforms import (
@@ -390,6 +405,9 @@ __all__ = [
     "Not",
     "Nothing",
     "OfType",
+    "OptState",
+    "OptVariable",
+    "Optimizer",
     "OptimizedLSTMCell",
     "PReLU",
     "PaddingLike",
@@ -438,7 +456,9 @@ __all__ = [
     "one_hot",
     "relu",
     "relu6",
+    "restore_state",
     "rnglib",
+    "save_state",
     "selu",
     "sigmoid",
     "silu",
