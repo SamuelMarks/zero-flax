@@ -13,6 +13,7 @@ from zero_chex._src.tree_util import tree_leaves as chex_tree_leaves
 from zero_jax import numpy as jnp
 from zero_optax._tree import asarray as optax_asarray
 from zero_optax._tree import tree_map as optax_tree_map
+from zero_optax.base import ExtraArgValue
 
 from zero_flax.core import FrozenDict, freeze
 from zero_flax.nnx import (
@@ -305,7 +306,7 @@ def test_nnx_optimizer_all_12_optax_optimizers_and_orbax_roundtrip(tmp_path: Pat
         updates: zero_optax.Updates,
         state: zero_optax.OptState,
         params: zero_optax.Params | None = None,
-        **extra_args: float | int | str | bool | Tensor | None,
+        **extra_args: ExtraArgValue,
     ) -> tuple[zero_optax.Updates, zero_optax.EmptyState]:
         """Scale updates by extra_args['scale'] for extra_args test.
 
@@ -325,7 +326,7 @@ def test_nnx_optimizer_all_12_optax_optimizers_and_orbax_roundtrip(tmp_path: Pat
         return scaled, zero_optax.EmptyState()
 
     extra_tx: zero_optax.GradientTransformationExtraArgs[zero_optax.EmptyState] = (
-        zero_optax.GradientTransformationExtraArgs(init=_extra_init, update=_extra_update)
+        zero_optax.GradientTransformationExtraArgs(_extra_init, _extra_update)
     )
     opt_extra = Optimizer(Linear(2, 2), extra_tx)
     opt_extra.update(

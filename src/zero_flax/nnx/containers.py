@@ -239,7 +239,6 @@ class List(Module, list[ItemT], Generic[ItemT]):
         self,
         it: Optional[Iterable[ItemT]] = None,
         /,
-        *,
         _pytree__has_int_keys: bool = True,
     ) -> None:
         """Initialize a List module from an optional iterable of items.

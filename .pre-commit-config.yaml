@@ -51,10 +51,10 @@ repos:
         pass_filenames: false
 
       - id: check-api-compliance
-        name: Check API Compliance
+        name: Check API Compliance (ml-ecosystem-snapshots v0.0.5)
         entry: python3 scripts/check_compliance.py
         language: system
-        files: ^(SEMANTIC_PLAN\.md|src/.*\.py)$
+        files: ^(SEMANTIC_PLAN\.md|src/.*\.py|scripts/.*\.py)$
         pass_filenames: false
 
       - id: check-compiler-tests

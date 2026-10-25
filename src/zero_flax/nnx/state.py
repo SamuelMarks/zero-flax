@@ -49,6 +49,7 @@ if TYPE_CHECKING:
     from zero_optax import (
         PyTree as OptaxPyTree,
     )
+    from zero_optax.base import ExtraArgValue
     from zero_orbax.types import PathLike
     from zero_orbax.types import PyTree as OrbaxPyTree
 
@@ -580,7 +581,7 @@ class Optimizer(Generic[M_opt]):
     def update(
         self,
         grads: Union[State, Mapping[str, StateEntry]],
-        **extra_args: Union[float, int, str, bool, Tensor, None],
+        **extra_args: ExtraArgValue,
     ) -> None:
         """Apply one optimization step to ``self.model`` using ``grads`` and ``self.tx``.
 

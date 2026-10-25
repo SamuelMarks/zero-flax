@@ -7,3 +7,4 @@ pydantic
 build
 colorama
 cdd @ git+https://github.com/offscale/cdd-python.git@master
+ml-ecosystem-snapshots @ https://github.com/SamuelMarks/ml-ecosystem-snapshots/releases/download/v0.0.5/ml_ecosystem_snapshots-0.0.5-py3-none-any.whl

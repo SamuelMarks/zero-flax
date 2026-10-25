@@ -47,6 +47,18 @@ jobs:
         repository: SamuelMarks/zero-optax
         path: zero-optax
 
+    - name: Checkout zero-orbax
+      uses: actions/checkout@v4
+      with:
+        repository: SamuelMarks/zero-orbax
+        path: zero-orbax
+
+    - name: Checkout zero-grain
+      uses: actions/checkout@v4
+      with:
+        repository: SamuelMarks/zero-grain
+        path: zero-grain
+
     - name: Set up Python 3.11
       uses: actions/setup-python@v5
       with:
@@ -61,13 +73,15 @@ jobs:
           "git+https://github.com/SamuelMarks/griffe.git@rest#subdirectory=packages/griffelib" \
           "git+https://github.com/SamuelMarks/griffe.git@rest#subdirectory=packages/griffecli" \
           "git+https://github.com/SamuelMarks/griffe.git@rest"
-        pip install --no-deps "https://github.com/SamuelMarks/ml-ecosystem-snapshots/releases/download/v0.0.4/ml_ecosystem_snapshots-0.0.4-py3-none-any.whl"
+        pip install --no-deps "https://github.com/SamuelMarks/ml-ecosystem-snapshots/releases/download/v0.0.5/ml_ecosystem_snapshots-0.0.5-py3-none-any.whl"
         pip install -e ../ml-switcheroo-ir
         pip install libcst h5py pyyaml
         pip install --no-deps -e ../ml-switcheroo-compiler
         pip install --no-deps -e ../zero-jax
         pip install --no-deps -e ../zero-chex
         pip install --no-deps -e ../zero-optax
+        pip install --no-deps -e ../zero-orbax
+        pip install --no-deps -e ../zero-grain
         pip install --no-deps -e .
 
     - name: Run Ruff Format & Lint

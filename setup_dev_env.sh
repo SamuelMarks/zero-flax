@@ -6,7 +6,7 @@ pip install --no-deps \
   "git+https://github.com/SamuelMarks/griffe.git@rest#subdirectory=packages/griffelib" \
   "git+https://github.com/SamuelMarks/griffe.git@rest#subdirectory=packages/griffecli" \
   "git+https://github.com/SamuelMarks/griffe.git@rest"
-pip install --no-deps "https://github.com/SamuelMarks/ml-ecosystem-snapshots/releases/download/v0.0.4/ml_ecosystem_snapshots-0.0.4-py3-none-any.whl" || pip install --no-deps -e ../ml-ecosystem-snapshots
+pip install --no-deps "https://github.com/SamuelMarks/ml-ecosystem-snapshots/releases/download/v0.0.5/ml_ecosystem_snapshots-0.0.5-py3-none-any.whl" || pip install --no-deps -e ../ml-ecosystem-snapshots
 pip install -e ../ml-switcheroo-ir
 pip install --no-deps -e ../ml-switcheroo-compiler
 pip install --no-deps -e ../zero-jax

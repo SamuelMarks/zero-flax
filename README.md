@@ -26,11 +26,9 @@ When you execute models using `zero-flax`, it routes operations through `zero-ja
 
 ### Current Feature-Set (100% Compliance)
 
-We have achieved **100.0% Overall Compliance** with the targeted subset of the `flax` API (validated via `ml-ecosystem-snapshots` v0.0.4 `flax_nnx_v0.12.10.json`):
-- `flax.nnx`: 100% (35/35 core layers, recurrent cells, normalizations, containers, and transforms)
-- `zero_jax.nn.initializers`: 100% (19/19)
-- `zero_optax.losses`: 100% (19/19)
-- `zero_optax.schedules`: 100% (16/16)
+We have achieved **100.0% Overall Compliance** with the targeted `flax.nnx` API surface (validated via `ml-ecosystem-snapshots` v0.0.5 `flax_nnx_v0.12.10.json`):
+- `flax.nnx`: 100% (all 29 snapshot classes + 6 functional transforms and aliases = 35/35 core layers, recurrent cells, normalizations, containers, and transforms)
+- Sibling ecosystem packages (`../zero-jax`, `../zero-chex`, `../zero-grain`, `../zero-optax`, `../zero-orbax`) provide the JAX, Chex, Grain, Optax, and Orbax API surfaces without duplicating them inside `zero-flax`.
 
 Every layer, from `Linear` to `MultiHeadAttention`, is strictly mathematically tested and forwards logic perfectly to the underlying compiler.
 
@@ -43,7 +41,7 @@ Every layer, from `Linear` to `MultiHeadAttention`, is strictly mathematically t
 4. **Tier 4 (Frontends & Add-ons):** Repositories like `zero-flax`, `zero-optax`, and `zero-chex` build on top of `zero-jax` to provide Neural Network layers, optimizers, and typing without any heavy external dependencies.
 5. **Tier 5 (`zero-zoo`):** Headless CI pipelines that train models deterministically to assert float-for-float equivalence ("Golden Seed" testing) across all simulated frameworks.
 
-By perfectly mirroring the API signature of the authentic `flax.nnx` package (verified strictly via automated semantic snapshot testing in `ml-ecosystem-snapshots` v0.0.4, scoring against `flax_nnx_v0.12.10`), `zero-flax` allows users to drop it in as a lightweight substitute in environments where installing the massive official JAX/XLA stack is unfeasible—such as highly constrained serverless functions, or directly inside a web browser natively via Pyodide and PyScript.
+By perfectly mirroring the API signature of the authentic `flax.nnx` package (verified strictly via automated semantic snapshot testing in `ml-ecosystem-snapshots` v0.0.5, scoring against `flax_nnx_v0.12.10`), `zero-flax` allows users to drop it in as a lightweight substitute in environments where installing the massive official JAX/XLA stack is unfeasible—such as highly constrained serverless functions, or directly inside a web browser natively via Pyodide and PyScript.
 
 ---
 

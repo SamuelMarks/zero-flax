@@ -179,7 +179,7 @@ def test_check_deps_script(tmp_path: Path) -> None:
 
 
 def test_check_compliance_script(tmp_path: Path) -> None:
-    """Verify check_compliance against SEMANTIC_PLAN.md and synthetic plans.
+    """Verify check_compliance against SEMANTIC_PLAN.md, ml-ecosystem-snapshots v0.0.5, and synthetic plans.
 
     Args:
         tmp_path: Temporary pytest directory fixture.
@@ -189,6 +189,120 @@ def test_check_compliance_script(tmp_path: Path) -> None:
         "zero_flax.nnx",
         "Linear",
     )
+    assert check_compliance._resolve_module_and_symbol("## jax.nn.initializers", "ones") == (
+        "zero_jax.nn.initializers",
+        "ones",
+    )
+    assert check_compliance._resolve_module_and_symbol("## jax.nn", "gelu") == (
+        "zero_jax.nn",
+        "gelu",
+    )
+    assert check_compliance._resolve_module_and_symbol("## optax.losses", "l2_loss") == (
+        "zero_optax.losses",
+        "l2_loss",
+    )
+    assert check_compliance._resolve_module_and_symbol(
+        "## optax.schedules", "constant_schedule"
+    ) == (
+        "zero_optax.schedules",
+        "constant_schedule",
+    )
+
+    assert check_compliance.verify_no_forbidden_submodules(str(tmp_path / "nonexistent_src")) == []
+    bad_src = tmp_path / "bad_src"
+    (bad_src / "grain").mkdir(parents=True)
+    (bad_src / "optax.py").write_text("# forbidden\n", encoding="utf-8")
+    (bad_src / "allowed.py").write_text("# allowed\n", encoding="utf-8")
+    assert len(check_compliance.verify_no_forbidden_submodules(str(bad_src))) == 2
+    assert check_compliance.main([], src_root=str(bad_src)) == 1
+
+    missing_snap = tmp_path / "no_snap.json"
+    assert check_compliance.main([], snapshot_path=missing_snap) == 1
+
+    from zero_flax.nnx.module import Module
+
+    class _NoClassDoc(Module):
+        """Has class doc in AST, cleared at runtime."""
+
+        def __init__(self, x: int) -> None:
+            """Init doc.
+
+            Args:
+                x: Value.
+            """
+            super().__init__()
+            self.x = x
+
+    class _NoInitDoc(Module):
+        """Has class doc."""
+
+        def __init__(self, x: int) -> None:
+            """Init doc in AST, cleared at runtime.
+
+            Args:
+                x: Value.
+            """
+            super().__init__()
+            self.x = x
+
+    class _BadParams(Module):
+        """Has class doc."""
+
+        def __init__(self, a: int, *, b: int) -> None:
+            """Init doc.
+
+            Args:
+                a: Documented a.
+                b: Documented b in AST, removed at runtime.
+            """
+            super().__init__()
+            self.a = a
+            self.b = b
+
+    _NoClassDoc.__doc__ = None
+    _NoInitDoc.__init__.__doc__ = None
+    _BadParams.__init__.__annotations__.pop("a", None)
+    _BadParams.__init__.__doc__ = "Init doc.\n\nArgs:\n    a: Documented a.\n"
+
+    custom_registry: dict[str, type[Module]] = {
+        "NoClassDoc": _NoClassDoc,
+        "NoInitDoc": _NoInitDoc,
+        "BadParams": _BadParams,
+    }
+    bad_snap = tmp_path / "bad_snap.json"
+    bad_snap.write_text(
+        NL.join(
+            [
+                "{",
+                '  "version": "0.12.10",',
+                '  "categories": {',
+                '    "layer": [',
+                "      123,",
+                '      {"api_path": "jax.nn.relu", "name": "relu"},',
+                '      {"api_path": "flax.nnx.MissingCls", "name": "MissingCls"},',
+                '      {"api_path": "flax.nnx.NoClassDoc", "name": "NoClassDoc"},',
+                '      {"api_path": "flax.nnx.NoInitDoc", "name": "NoInitDoc"},',
+                '      {"api_path": "flax.nnx.BadParams", "name": "BadParams", "params": 123},',
+                '      {"api_path": "flax.nnx.BadParams", "name": "BadParams", "params": [',
+                "        456,",
+                '        {"name": "missing_p", "kind": "POSITIONAL_OR_KEYWORD", "default": null},',
+                '        {"name": "a", "kind": "KEYWORD_ONLY", "default": "1"},',
+                '        {"name": "b", "kind": "KEYWORD_ONLY", "default": "2"}',
+                "      ]}",
+                "    ]",
+                "  }",
+                "}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    ok_cnt, tot_cnt, snap_errs = check_compliance.verify_snapshot_v005(
+        snapshot_path=bad_snap,
+        registry=custom_registry,
+    )
+    assert ok_cnt == 0
+    assert tot_cnt == 5
+    assert len(snap_errs) >= 6
 
     missing_plan = tmp_path / "MISSING.md"
     assert check_compliance.main([str(missing_plan)]) == 0
