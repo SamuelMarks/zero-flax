@@ -13,54 +13,42 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v7
       with:
         path: zero-flax
 
-    - name: Checkout ml-switcheroo-ir
-      uses: actions/checkout@v4
-      with:
-        repository: SamuelMarks/ml-switcheroo-ir
-        path: ml-switcheroo-ir
-
-    - name: Checkout ml-switcheroo-compiler
-      uses: actions/checkout@v4
-      with:
-        repository: SamuelMarks/ml-switcheroo-compiler
-        path: ml-switcheroo-compiler
-
     - name: Checkout zero-jax
-      uses: actions/checkout@v4
+      uses: actions/checkout@v7
       with:
         repository: SamuelMarks/zero-jax
         path: zero-jax
 
     - name: Checkout zero-chex
-      uses: actions/checkout@v4
+      uses: actions/checkout@v7
       with:
         repository: SamuelMarks/zero-chex
         path: zero-chex
 
     - name: Checkout zero-optax
-      uses: actions/checkout@v4
+      uses: actions/checkout@v7
       with:
         repository: SamuelMarks/zero-optax
         path: zero-optax
 
     - name: Checkout zero-orbax
-      uses: actions/checkout@v4
+      uses: actions/checkout@v7
       with:
         repository: SamuelMarks/zero-orbax
         path: zero-orbax
 
     - name: Checkout zero-grain
-      uses: actions/checkout@v4
+      uses: actions/checkout@v7
       with:
         repository: SamuelMarks/zero-grain
         path: zero-grain
 
     - name: Set up Python 3.11
-      uses: actions/setup-python@v5
+      uses: actions/setup-python@v7
       with:
         python-version: "3.11"
 
@@ -74,9 +62,9 @@ jobs:
           "git+https://github.com/SamuelMarks/griffe.git@rest#subdirectory=packages/griffecli" \
           "git+https://github.com/SamuelMarks/griffe.git@rest"
         pip install --no-deps "https://github.com/SamuelMarks/ml-ecosystem-snapshots/releases/download/v0.0.5/ml_ecosystem_snapshots-0.0.5-py3-none-any.whl"
-        pip install -e ../ml-switcheroo-ir
-        pip install libcst h5py pyyaml
-        pip install --no-deps -e ../ml-switcheroo-compiler
+        pip install "https://github.com/SamuelMarks/ml-switcheroo-ir/releases/download/v0.0.4/ml_switcheroo_ir-0.0.4-py3-none-any.whl"
+        pip install "https://github.com/SamuelMarks/ml-switcheroo-compiler/releases/download/v0.0.1/ml_switcheroo_compiler-0.0.1-py3-none-any.whl"
+        python -c "import pathlib, ml_switcheroo_compiler; (pathlib.Path(ml_switcheroo_compiler.__file__).parent / 'py.typed').touch()"
         pip install --no-deps -e ../zero-jax
         pip install --no-deps -e ../zero-chex
         pip install --no-deps -e ../zero-optax

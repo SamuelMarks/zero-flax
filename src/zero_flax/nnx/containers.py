@@ -65,19 +65,6 @@ ContainerItem: TypeAlias = Union[
 ItemT = TypeVar("ItemT", bound=ContainerItem)
 
 
-def _is_typed_item(val: ContainerItem) -> TypeGuard[ItemT]:
-    """Narrow a ``ContainerItem`` registry entry to ``ItemT``.
-
-    Args:
-        val: Registry item to narrow.
-
-    Returns:
-        ``True``.
-    """
-    _ = val
-    return True
-
-
 class Dict(Module, Generic[ItemT]):
     """Dictionary container module registering ``Module`` and ``Variable`` values in NNX state.
 
@@ -112,6 +99,18 @@ class Dict(Module, Generic[ItemT]):
             self[k] = v
         self.finish_init()
 
+    def _is_typed_item(self, val: ContainerItem) -> TypeGuard[ItemT]:
+        """Narrow a ``ContainerItem`` registry entry to this container's ``ItemT``.
+
+        Args:
+            val: Registry item to narrow.
+
+        Returns:
+            ``True``.
+        """
+        _ = val
+        return True
+
     def _on_state_updated(self) -> None:
         """Synchronize ``self._data`` after ``update()`` or ``merge()`` mutates registries."""
         raw_updates: list[Tuple[str, ContainerItem]] = [
@@ -119,7 +118,7 @@ class Dict(Module, Generic[ItemT]):
             *self._variables.items(),
             *self._static_config.items(),
         ]
-        self._data.update({k: v for k, v in raw_updates if _is_typed_item(v)})
+        self._data.update({k: v for k, v in raw_updates if self._is_typed_item(v)})
 
     def __setitem__(self, key: str, value: ItemT) -> None:
         """Store ``value`` under ``key`` and synchronize child/variable/static registries.
@@ -318,6 +317,18 @@ class List(Module, list[ItemT], Generic[ItemT]):
             elif isinstance(item, (str, int, float, bool, tuple)) or item is None:
                 self.register_static(key, item)
 
+    def _is_typed_item(self, val: ContainerItem) -> TypeGuard[ItemT]:
+        """Narrow a ``ContainerItem`` registry entry to this list's ``ItemT``.
+
+        Args:
+            val: Registry item to narrow.
+
+        Returns:
+            ``True``.
+        """
+        _ = val
+        return True
+
     def _on_state_updated(self) -> None:
         """Synchronize sequence elements after ``update()`` or ``merge()`` mutates registries.
 
@@ -350,7 +361,7 @@ class List(Module, list[ItemT], Generic[ItemT]):
             return
         max_idx = max(indexed_updates.keys())
         raw_items: list[ContainerItem] = [indexed_updates.get(i) for i in range(max_idx + 1)]
-        rebuilt: list[ItemT] = [x for x in raw_items if _is_typed_item(x)]
+        rebuilt: list[ItemT] = [x for x in raw_items if self._is_typed_item(x)]
         list.clear(self)
         list.extend(self, rebuilt)
         self._rebuild_registries()
