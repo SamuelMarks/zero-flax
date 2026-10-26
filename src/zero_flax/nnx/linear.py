@@ -56,8 +56,9 @@ def _assert_axis_dimension(tensor: JaxArray, axis: int, expected: int) -> None:
 def _normalize_einsum_equation(einsum_str: str) -> str:
     """Normalize an Einstein summation equation, inferring output subscripts if omitted.
 
-    Supports both standard subscript equations (e.g., ``"ab,bc"`` -> ``"ab,bc->ac"``)
-    and ellipsis broadcasting equations (e.g., ``"...ab,bc"`` -> ``"...ab,bc->...ac"``).
+    Supports both standard subscript equations (e.g., ``"ab,bc"`` -> ``"ab,bc->ac"``),
+    ellipsis broadcasting equations across one or both operands (e.g., ``"...ab,...bc"`` ->
+    ``"...ab,...bc->...ac"``), and trace/diagonal subscripts within an operand.
 
     Args:
         einsum_str: Raw Einstein summation string (e.g., ``"ab,bc->ac"`` or ``"ab,bc"``).
@@ -73,13 +74,13 @@ def _normalize_einsum_equation(einsum_str: str) -> str:
         return cleaned
     if "," not in cleaned:
         raise ValueError(f"Invalid einsum equation {einsum_str!r}: missing ',' between operands.")
-    has_ellipsis = "..." in cleaned
-    without_ellipsis = cleaned.replace("...", "")
-    counts: dict[str, int] = {}
-    for ch in without_ellipsis:
-        if ch.isalpha():
-            counts[ch] = counts.get(ch, 0) + 1
-    out_chars = "".join(sorted(ch for ch, cnt in counts.items() if cnt == 1))
+    operands = cleaned.split(",")
+    has_ellipsis = any("..." in op for op in operands)
+    stripped_operands = "".join(op.replace("...", "") for op in operands)
+    total_counts: dict[str, int] = {}
+    for ch in stripped_operands:
+        total_counts[ch] = total_counts.get(ch, 0) + 1
+    out_chars = "".join(sorted(ch for ch, cnt in total_counts.items() if cnt == 1))
     prefix = "..." if has_ellipsis else ""
     return f"{cleaned}->{prefix}{out_chars}"
 
@@ -306,6 +307,7 @@ class LinearGeneral(Module):
         out_features: Tuple of output feature dimension sizes.
         axis: Tuple of input axes to contract.
         batch_axis: Mapping of input batch axes to kernel batch axes.
+        batch_dims: Tuple of batch dimension sizes initialized in ``kernel`` and ``bias``.
         use_bias: Whether to add a learnable bias tensor.
         dtype: Computation data type.
         param_dtype: Parameter data type.
@@ -317,6 +319,7 @@ class LinearGeneral(Module):
     out_features: Tuple[int, ...]
     axis: Tuple[int, ...]
     batch_axis: dict[int, int]
+    batch_dims: Tuple[int, ...]
     use_bias: bool
     dtype: Optional[DType]
     param_dtype: DType
@@ -355,7 +358,7 @@ class LinearGeneral(Module):
             in_features: Input feature dimension size or sequence of sizes.
             out_features: Output feature dimension size or sequence of sizes.
             axis: Input axis or sequence of axes along which to contract.
-            batch_axis: Optional mapping (input_axis -> batch_dim_size_or_rhs_axis) or sequence of batch dimension sizes/axes.
+            batch_axis: Optional mapping ``(input_axis -> batch_dim_size)`` or sequence of batch axes.
             use_bias: Whether to include a learnable bias tensor.
             dtype: Computation data type.
             param_dtype: Parameter initialization data type.
@@ -369,6 +372,9 @@ class LinearGeneral(Module):
             rngs: Random number generator stream(s).
             kernel_metadata: Metadata attached to ``kernel``.
             bias_metadata: Metadata attached to ``bias``.
+
+        Raises:
+            ValueError: If ``len(axis) != len(in_features)``.
         """
         super().__init__()
         self.in_features = (
@@ -381,13 +387,27 @@ class LinearGeneral(Module):
             if isinstance(out_features, int)
             else tuple(int(f) for f in out_features)
         )
-        self.axis = (int(axis),) if isinstance(axis, int) else tuple(int(a) for a in axis)
+        if isinstance(axis, int):
+            if len(self.in_features) > 1:
+                self.axis = tuple(range(-len(self.in_features), 0))
+            else:
+                self.axis = (int(axis),)
+        else:
+            self.axis = tuple(int(a) for a in axis)
+        if len(self.axis) != len(self.in_features):
+            raise ValueError(
+                f"LinearGeneral axis length ({len(self.axis)}) must match "
+                f"in_features length ({len(self.in_features)})."
+            )
         if batch_axis is None:
             self.batch_axis = {}
+            self.batch_dims = ()
         elif isinstance(batch_axis, Mapping):
-            self.batch_axis = {int(k): int(v) for k, v in batch_axis.items()}
+            self.batch_axis = {int(k): idx for idx, k in enumerate(batch_axis.keys())}
+            self.batch_dims = tuple(max(1, int(v)) for v in batch_axis.values())
         else:
             self.batch_axis = {int(ax): idx for idx, ax in enumerate(batch_axis)}
+            self.batch_dims = (1,) * len(self.batch_axis)
         self.use_bias = bool(use_bias)
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -400,8 +420,7 @@ class LinearGeneral(Module):
         k_fn = resolve_initializer(kernel_init, default_kernel_init)
         k_key = resolve_rng_key(rngs, "params", fold_index=0)
         k_meta = dict(kernel_metadata) if kernel_metadata is not None else {}
-        batch_dims_prefix = (1,) * len(self.batch_axis)
-        kernel_shape = batch_dims_prefix + self.in_features + self.out_features
+        kernel_shape = self.batch_dims + self.in_features + self.out_features
         self.kernel = self.register_variable(
             "kernel",
             Param(k_fn(k_key, kernel_shape, param_dtype), **k_meta),
@@ -411,7 +430,7 @@ class LinearGeneral(Module):
             b_fn = resolve_initializer(bias_init, default_bias_init)
             b_key = resolve_rng_key(rngs, "params", fold_index=1)
             b_meta = dict(bias_metadata) if bias_metadata is not None else {}
-            bias_shape = batch_dims_prefix + self.out_features
+            bias_shape = self.batch_dims + self.out_features
             self.bias = self.register_variable(
                 "bias",
                 Param(b_fn(b_key, bias_shape, param_dtype), **b_meta),
@@ -448,7 +467,7 @@ class LinearGeneral(Module):
         ndim = x.ndim
         norm_axes = tuple(a if a >= 0 else ndim + a for a in self.axis)
         lhs_batch_axes = tuple(a if a >= 0 else ndim + a for a in self.batch_axis)
-        rhs_batch_axes = tuple(b if b >= 0 else k.ndim + b for b in self.batch_axis.values())
+        rhs_batch_axes = tuple(range(len(self.batch_axis)))
         if len(rhs_batch_axes) > 0:
             expanded_k = k
             for lhs_ax, rhs_ax in zip(lhs_batch_axes, rhs_batch_axes):
@@ -458,7 +477,7 @@ class LinearGeneral(Module):
                     )
             k = expanded_k
         kernel_contract_axes = tuple(
-            i for i in range(len(rhs_batch_axes) + len(self.in_features)) if i not in rhs_batch_axes
+            range(len(rhs_batch_axes), len(rhs_batch_axes) + len(self.in_features))
         )
         for ax, expected_dim in zip(norm_axes, self.in_features):
             if ax < 0 or ax >= ndim or x.shape[ax] != expected_dim:

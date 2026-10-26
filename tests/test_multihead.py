@@ -74,6 +74,10 @@ def test_multihead_decode_and_sow_weights() -> None:
 
     with pytest.raises(ValueError, match="init_cache"):
         m(x_step, decode=True)
+    with pytest.raises(ValueError, match="init_cache expects input_shape"):
+        m.init_cache((4,))
+    with pytest.raises(ValueError, match="init_cache expects input_shape"):
+        m.init_cache((1, 3, 5))
 
     m.init_cache((1, 3, 4))
     assert m.cached_key is not None

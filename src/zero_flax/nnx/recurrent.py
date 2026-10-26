@@ -968,6 +968,31 @@ class OptimizedLSTMCell(RNNCellBase):
         return (new_c, new_h), new_h
 
 
+def _select_masked_carry(
+    mask_cond: JaxArray,
+    new_carry: CarryType,
+    old_carry: CarryType,
+) -> CarryType:
+    """Select ``new_carry`` where ``mask_cond`` is ``True`` and ``old_carry`` where ``False``.
+
+    Args:
+        mask_cond: Boolean mask broadcastable to carry batch dimensions.
+        new_carry: Candidate updated carry state.
+        old_carry: Previous carry state to retain on padded steps.
+
+    Returns:
+        Masked carry state matching the structure of ``new_carry``.
+    """
+    if isinstance(new_carry, tuple) and isinstance(old_carry, tuple):
+        return (
+            jnp.where(mask_cond, new_carry[0], old_carry[0]),
+            jnp.where(mask_cond, new_carry[1], old_carry[1]),
+        )
+    nc = new_carry[0] if isinstance(new_carry, tuple) else new_carry
+    oc = old_carry[0] if isinstance(old_carry, tuple) else old_carry
+    return jnp.where(mask_cond, nc, oc)
+
+
 class RNN(Module):
     r"""Recurrent sequence wrapper unrolling an ``RNNCellBase`` across the time dimension.
 
@@ -1033,6 +1058,7 @@ class RNN(Module):
         inputs: ArrayLike,
         *,
         initial_carry: Optional[CarryType] = None,
+        seq_lengths: Optional[ArrayLike] = None,
         return_carry: Optional[bool] = None,
         time_major: Optional[bool] = None,
         reverse: Optional[bool] = None,
@@ -1043,6 +1069,7 @@ class RNN(Module):
         Args:
             inputs: Sequence tensor of shape ``(batch, time, features)`` (or ``(time, batch, features)`` if ``time_major``).
             initial_carry: Optional explicit starting carry state.
+            seq_lengths: Optional integer array of valid sequence lengths per batch element.
             return_carry: Optional override for ``self.return_carry``.
             time_major: Optional override for ``self.time_major``.
             reverse: Optional override for ``self.reverse``.
@@ -1078,11 +1105,24 @@ class RNN(Module):
                 return carry, empty_seq
             return empty_seq
 
+        seq_len_arr: Optional[JaxArray] = (
+            ensure_array(seq_lengths, dtype="int32") if seq_lengths is not None else None
+        )
         indices = list(range(seq_len - 1, -1, -1)) if rev else list(range(seq_len))
         outputs: list[JaxArray] = []
         for t_idx in indices:
             step_x = x[t_idx] if tm else x[:, t_idx]
-            carry, step_y = self.cell(carry, step_x)
+            prev_carry = carry
+            next_carry, step_y = self.cell(carry, step_x)
+            if seq_len_arr is not None:
+                valid_mask = jnp.reshape(
+                    t_idx < seq_len_arr,
+                    (-1,) + (1,) * max(0, step_y.ndim - 1),
+                )
+                carry = _select_masked_carry(valid_mask, next_carry, prev_carry)
+                step_y = jnp.where(valid_mask, step_y, jnp.zeros_like(step_y))
+            else:
+                carry = next_carry
             outputs.append(jnp.expand_dims(step_y, axis=time_axis))
 
         if rev and ko:
@@ -1160,6 +1200,7 @@ class Bidirectional(Module):
         inputs: ArrayLike,
         *,
         initial_carry: Optional[Tuple[CarryType, CarryType]] = None,
+        seq_lengths: Optional[ArrayLike] = None,
         return_carry: Optional[bool] = None,
         time_major: Optional[bool] = None,
         reverse: Optional[bool] = None,
@@ -1170,6 +1211,7 @@ class Bidirectional(Module):
         Args:
             inputs: Sequence input tensor.
             initial_carry: Optional tuple ``(fwd_initial_carry, bwd_initial_carry)``.
+            seq_lengths: Optional integer array of valid sequence lengths per batch element.
             return_carry: Optional override for ``self.return_carry``.
             time_major: Optional override for ``self.time_major``.
             reverse: Optional override for backward RNN reverse flag.
@@ -1188,6 +1230,7 @@ class Bidirectional(Module):
         fwd_res = self.forward_rnn(
             inputs,
             initial_carry=fwd_init_c,
+            seq_lengths=seq_lengths,
             return_carry=True,
             time_major=tm,
             reverse=self.forward_rnn.reverse,
@@ -1196,6 +1239,7 @@ class Bidirectional(Module):
         bwd_res = self.backward_rnn(
             inputs,
             initial_carry=bwd_init_c,
+            seq_lengths=seq_lengths,
             return_carry=True,
             time_major=tm,
             reverse=bwd_rev,

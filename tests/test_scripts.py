@@ -394,8 +394,8 @@ def test_update_badges_script(tmp_path: Path) -> None:
     )
     update_badges.update_readme(str(readme), cov_pct=100.0, doc_pct=100.0, api_pct=100.0)
     updated_text = readme.read_text(encoding="utf-8")
-    assert "coverage-100%25-brightgreen.svg" in updated_text
-    assert "docs-100%25-brightgreen.svg" in updated_text
+    assert "test_coverage-100%25-brightgreen.svg" in updated_text
+    assert "doc_coverage-100%25-brightgreen.svg" in updated_text
     assert "api_compliance-100%25-brightgreen.svg" in updated_text
 
     readme_no_api = tmp_path / "README_NO_API.md"

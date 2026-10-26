@@ -2,16 +2,18 @@
 
 This module implements n-D spatial convolution, transposed convolution, and
 token embedding table lookup layers with exact `flax_nnx_v0.12.10` signatures
-and pure-Python/Switcheroo tensor execution.
+delegating to `ml_switcheroo_compiler.ops.conv_general_dilated` and `zero_jax`.
 """
 
 from __future__ import annotations
 
-import itertools
 from collections.abc import Sequence
 from typing import Optional, Tuple, Union
 
+import ml_switcheroo_compiler.ops as compiler_ops
+from ml_switcheroo_compiler.ops.configs import ConvConfig
 from zero_jax import numpy as jnp
+from zero_jax.numpy.lax_numpy import _to_tensor, _wrap
 
 from zero_flax.nnx.module import Module
 from zero_flax.nnx.rnglib import Rngs, RngStream, resolve_rng_key
@@ -188,67 +190,24 @@ def _resolve_spatial_pads(
     return computed, is_circular
 
 
-def _dilate_spatial_nd(
-    x: JaxArray,
-    dilations: Sequence[int],
-) -> JaxArray:
-    """Dilate spatial dimensions of ``x`` by inserting ``d - 1`` zeros between adjacent elements.
-
-    Args:
-        x: Batched tensor of shape ``(batch, *spatial, channels)``.
-        dilations: Dilation factor for each spatial dimension.
-
-    Returns:
-        Spatially dilated ``JaxArray``.
-    """
-    if all(d <= 1 for d in dilations):
-        return x
-    cur = x
-    dt_str = sanitize_dtype_str(str(cur.dtype).lower())
-    for s_i, d in enumerate(dilations):
-        if d <= 1:
-            continue
-        axis = 1 + s_i
-        length = cur.shape[axis]
-        if length <= 1:
-            continue
-        zero_shape = list(cur.shape)
-        zero_shape[axis] = d - 1
-        zero_block = jnp.zeros(tuple(zero_shape), dtype=dt_str)
-        pieces: list[JaxArray] = []
-        for idx in range(length):
-            slices = [slice(None)] * cur.ndim
-            slices[axis] = slice(idx, idx + 1)
-            pieces.append(cur[tuple(slices)])
-            if idx < length - 1:
-                pieces.append(zero_block)
-        cur = jnp.concatenate(pieces, axis=axis)
-    return cur
-
-
-def _pad_spatial_nd(
+def _pad_circular_spatial_nd(
     x: JaxArray,
     spatial_pads: Sequence[Tuple[int, int]],
-    circular: bool = False,
 ) -> JaxArray:
-    """Pad spatial axes of ``x`` with zeros or circular boundary wraps according to ``spatial_pads``.
+    """Wrap spatial axes of ``x`` modularly from opposite boundaries according to ``spatial_pads``.
 
     Args:
         x: Input array of shape ``(batch, *spatial, channels)``.
         spatial_pads: Sequence of ``(pad_before, pad_after)`` pairs for each spatial axis.
-        circular: If ``True``, wrap values modularly from opposite spatial boundaries instead of zero-padding.
 
     Returns:
-        Padded ``JaxArray``.
+        Circularly padded ``JaxArray``.
     """
-    if all(p0 == 0 and p1 == 0 for p0, p1 in spatial_pads):
-        return x
     cur = x
-    dt_str = sanitize_dtype_str(str(cur.dtype).lower())
     for idx, (pad_before, pad_after) in enumerate(spatial_pads):
         axis = 1 + idx
         orig_axis_len = cur.shape[axis]
-        if circular and orig_axis_len > 0:
+        if pad_before > 0 or pad_after > 0:
             pieces: list[JaxArray] = []
             for p_idx in range(-pad_before, orig_axis_len + pad_after):
                 wrap_idx = p_idx % orig_axis_len
@@ -256,18 +215,50 @@ def _pad_spatial_nd(
                 slices[axis] = slice(wrap_idx, wrap_idx + 1)
                 pieces.append(cur[tuple(slices)])
             cur = jnp.concatenate(pieces, axis=axis)
-        else:
-            shape_list = list(cur.shape)
-            if pad_before > 0:
-                pre_shape = list(shape_list)
-                pre_shape[axis] = pad_before
-                cur = jnp.concatenate([jnp.zeros(tuple(pre_shape), dtype=dt_str), cur], axis=axis)
-                shape_list = list(cur.shape)
-            if pad_after > 0:
-                post_shape = list(shape_list)
-                post_shape[axis] = pad_after
-                cur = jnp.concatenate([cur, jnp.zeros(tuple(post_shape), dtype=dt_str)], axis=axis)
     return cur
+
+
+def _execute_compiler_conv_general_dilated(
+    lhs_nhwc: JaxArray,
+    rhs_hwio: JaxArray,
+    window_strides: Tuple[int, ...],
+    padding_pairs: list[Tuple[int, int]],
+    lhs_dilation: Tuple[int, ...],
+    rhs_dilation: Tuple[int, ...],
+    feature_group_count: int = 1,
+) -> JaxArray:
+    """Execute n-D dilated convolution via ``ml_switcheroo_compiler.ops.conv_general_dilated``.
+
+    Args:
+        lhs_nhwc: Input tensor in ``(N, *spatial, C_in)`` layout.
+        rhs_hwio: Filter tensor in ``(*spatial, C_in_per_group, C_out)`` layout.
+        window_strides: Spatial convolution strides.
+        padding_pairs: Per-axis ``(pad_before, pad_after)`` padding pairs.
+        lhs_dilation: Spatial input dilation factors.
+        rhs_dilation: Spatial filter dilation factors.
+        feature_group_count: Number of channel feature groups.
+
+    Returns:
+        Output ``JaxArray`` in ``(N, *out_spatial, C_out)`` layout.
+    """
+    num_spatial = len(window_strides)
+    lhs_perm = (0, num_spatial + 1) + tuple(range(1, num_spatial + 1))
+    rhs_perm = (num_spatial + 1, num_spatial) + tuple(range(num_spatial))
+    cfg = ConvConfig(
+        window_strides=window_strides,
+        padding=padding_pairs,
+        lhs_dilation=lhs_dilation,
+        rhs_dilation=rhs_dilation,
+        dimension_numbers=(lhs_perm, rhs_perm, lhs_perm),
+        feature_group_count=feature_group_count,
+    )
+    out_tensor = compiler_ops.conv_general_dilated(
+        _to_tensor(lhs_nhwc),
+        _to_tensor(rhs_hwio),
+        cfg,
+    )
+    res: JaxArray = _wrap(out_tensor)
+    return res
 
 
 class Conv(Module):
@@ -432,8 +423,9 @@ class Conv(Module):
             Convolved ``JaxArray`` with ``out_features`` channels in the last dimension.
 
         Raises:
-            ValueError: If ``inputs`` has fewer than ``len(kernel_size) + 1`` dimensions or
-                its channel dimension does not match ``self.in_features``.
+            ValueError: If ``inputs`` has fewer than ``len(kernel_size) + 1`` dimensions,
+                its channel dimension does not match ``self.in_features``, or the padded
+                spatial dimension is smaller than the effective kernel size.
         """
         x = ensure_array(inputs, dtype=self.dtype)
         k = ensure_array(self.kernel.value, dtype=self.dtype)
@@ -478,9 +470,9 @@ class Conv(Module):
             batch_size *= b_dim
         x_batched = jnp.reshape(x, (batch_size, *spatial_shape, in_ch))
 
-        x_dilated = _dilate_spatial_nd(x_batched, self.input_dilation)
-        dilated_spatial = x_dilated.shape[1:-1]
-
+        dilated_spatial = tuple(
+            max(1, (spatial_shape[i] - 1) * self.input_dilation[i] + 1) for i in range(num_spatial)
+        )
         spatial_pads, is_circular = _resolve_spatial_pads(
             dilated_spatial,
             self.kernel_size,
@@ -489,41 +481,44 @@ class Conv(Module):
             self.padding,
             is_transpose=False,
         )
-        x_padded = _pad_spatial_nd(x_dilated, spatial_pads, circular=is_circular)
-        padded_spatial = x_padded.shape[1:-1]
-
-        out_spatial: list[int] = []
         for idx in range(num_spatial):
             eff_k = (self.kernel_size[idx] - 1) * self.kernel_dilation[idx] + 1
-            out_dim = max(1, (padded_spatial[idx] - eff_k) // self.strides[idx] + 1)
-            out_spatial.append(out_dim)
+            padded_size = dilated_spatial[idx] + spatial_pads[idx][0] + spatial_pads[idx][1]
+            if padded_size < eff_k:
+                raise ValueError(
+                    f"Conv padded spatial size ({padded_size}) is smaller than "
+                    f"effective kernel size ({eff_k}) along spatial axis {idx}."
+                )
 
-        comp_dt = sanitize_dtype_str(str(x.dtype).lower())
-        acc: JaxArray = jnp.zeros(
-            (batch_size, *out_spatial, self.out_features),
-            dtype=comp_dt,
+        if is_circular:
+            if any(d > 1 for d in self.input_dilation):
+                x_batched = _execute_compiler_conv_general_dilated(
+                    x_batched,
+                    jnp.eye(in_ch, dtype=sanitize_dtype_str(str(x.dtype).lower())).reshape(
+                        (1,) * num_spatial + (in_ch, in_ch)
+                    ),
+                    window_strides=(1,) * num_spatial,
+                    padding_pairs=[(0, 0)] * num_spatial,
+                    lhs_dilation=self.input_dilation,
+                    rhs_dilation=(1,) * num_spatial,
+                    feature_group_count=1,
+                )
+            x_batched = _pad_circular_spatial_nd(x_batched, spatial_pads)
+            eff_input_dilation = (1,) * num_spatial
+            eff_pads = [(0, 0)] * num_spatial
+        else:
+            eff_input_dilation = self.input_dilation
+            eff_pads = spatial_pads
+
+        acc = _execute_compiler_conv_general_dilated(
+            x_batched,
+            k,
+            window_strides=self.strides,
+            padding_pairs=eff_pads,
+            lhs_dilation=eff_input_dilation,
+            rhs_dilation=self.kernel_dilation,
+            feature_group_count=self.feature_group_count,
         )
-        kernel_ranges = [range(ks) for ks in self.kernel_size]
-        for k_idx in itertools.product(*kernel_ranges):
-            slices = [slice(None)]
-            for s_i, ki in enumerate(k_idx):
-                start = ki * self.kernel_dilation[s_i]
-                stop = start + out_spatial[s_i] * self.strides[s_i]
-                slices.append(slice(start, stop, self.strides[s_i]))
-            slices.append(slice(None))
-            window = x_padded[tuple(slices)]
-            k_weight = k[k_idx]
-            if self.feature_group_count == 1:
-                acc = acc + jnp.dot(window, k_weight)
-            else:
-                g_in = in_ch // self.feature_group_count
-                g_out = self.out_features // self.feature_group_count
-                parts: list[JaxArray] = []
-                for g in range(self.feature_group_count):
-                    w_g = window[..., g * g_in : (g + 1) * g_in]
-                    k_g = k_weight[:, g * g_out : (g + 1) * g_out]
-                    parts.append(jnp.dot(w_g, k_g))
-                acc = acc + jnp.concatenate(parts, axis=-1)
 
         if b_raw is not None:
             acc = acc + b_raw
@@ -531,6 +526,7 @@ class Conv(Module):
         if self.preferred_element_type is not None:
             acc = ensure_array(acc, dtype=self.preferred_element_type)
 
+        out_spatial = acc.shape[1:-1]
         final_shape = (*batch_shape, *out_spatial, self.out_features)
         return jnp.reshape(acc, final_shape)
 
@@ -662,9 +658,9 @@ class ConvTranspose(Module):
     def __call__(self, inputs: ArrayLike) -> JaxArray:
         """Apply n-D transposed spatial convolution to ``inputs``.
 
-        Implements fractionally strided convolution matching ``jax.lax.conv_transpose``:
-        dilates input spatial axes by ``self.strides``, applies transposed convolution
-        padding, and convolves with ``self.kernel`` at unit window stride.
+        Implements fractionally strided convolution matching ``jax.lax.conv_transpose``
+        by delegating to ``ml_switcheroo_compiler.ops.conv_general_dilated`` with
+        input dilation ``lhs_dilation = self.strides``.
 
         Args:
             inputs: Input tensor of shape ``(*batch, *spatial, in_features)``
@@ -725,7 +721,6 @@ class ConvTranspose(Module):
             batch_size *= b_dim
         x_batched = jnp.reshape(x, (batch_size, *spatial_shape, in_ch))
 
-        x_dilated = _dilate_spatial_nd(x_batched, self.strides)
         spatial_pads, is_circular = _resolve_spatial_pads(
             spatial_shape,
             self.kernel_size,
@@ -734,31 +729,36 @@ class ConvTranspose(Module):
             self.padding,
             is_transpose=True,
         )
-        x_padded = _pad_spatial_nd(x_dilated, spatial_pads, circular=is_circular)
-        padded_spatial = x_padded.shape[1:-1]
 
-        out_spatial: list[int] = []
-        for idx in range(num_spatial):
-            eff_k = (self.kernel_size[idx] - 1) * self.kernel_dilation[idx] + 1
-            out_dim = max(1, padded_spatial[idx] - eff_k + 1)
-            out_spatial.append(out_dim)
+        if is_circular:
+            if any(s > 1 for s in self.strides):
+                x_batched = _execute_compiler_conv_general_dilated(
+                    x_batched,
+                    jnp.eye(in_ch, dtype=sanitize_dtype_str(str(x.dtype).lower())).reshape(
+                        (1,) * num_spatial + (in_ch, in_ch)
+                    ),
+                    window_strides=(1,) * num_spatial,
+                    padding_pairs=[(0, 0)] * num_spatial,
+                    lhs_dilation=self.strides,
+                    rhs_dilation=(1,) * num_spatial,
+                    feature_group_count=1,
+                )
+            x_batched = _pad_circular_spatial_nd(x_batched, spatial_pads)
+            eff_strides = (1,) * num_spatial
+            eff_pads = [(0, 0)] * num_spatial
+        else:
+            eff_strides = self.strides
+            eff_pads = spatial_pads
 
-        comp_dt = sanitize_dtype_str(str(x.dtype).lower())
-        acc: JaxArray = jnp.zeros(
-            (batch_size, *out_spatial, self.out_features),
-            dtype=comp_dt,
+        acc = _execute_compiler_conv_general_dilated(
+            x_batched,
+            k_eff,
+            window_strides=(1,) * num_spatial,
+            padding_pairs=eff_pads,
+            lhs_dilation=eff_strides,
+            rhs_dilation=self.kernel_dilation,
+            feature_group_count=1,
         )
-        kernel_ranges = [range(ks) for ks in self.kernel_size]
-        for k_idx in itertools.product(*kernel_ranges):
-            slices = [slice(None)]
-            for s_i, ki in enumerate(k_idx):
-                start = ki * self.kernel_dilation[s_i]
-                stop = start + out_spatial[s_i]
-                slices.append(slice(start, stop, 1))
-            slices.append(slice(None))
-            window = x_padded[tuple(slices)]
-            k_weight = k_eff[k_idx]
-            acc = acc + jnp.dot(window, k_weight)
 
         if b_raw is not None:
             acc = acc + b_raw
@@ -766,6 +766,7 @@ class ConvTranspose(Module):
         if self.preferred_element_type is not None:
             acc = ensure_array(acc, dtype=self.preferred_element_type)
 
+        out_spatial = acc.shape[1:-1]
         return jnp.reshape(acc, (*batch_shape, *out_spatial, self.out_features))
 
 
@@ -854,7 +855,10 @@ class Embed(Module):
         Returns:
             Logit ``JaxArray`` with last dimension ``num_embeddings``.
         """
+        from zero_chex.assertions import assert_axis_dimension
+
         q = ensure_array(query)
+        assert_axis_dimension(q, -1, self.features)
         table = ensure_array(self.embedding.value)
         if self.promote_dtype is not None:
             promoted = self.promote_dtype(q, table, dtype=self.dtype)

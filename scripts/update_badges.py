@@ -83,13 +83,13 @@ def update_readme(
     api_color = get_color(resolved_api)
 
     content = re.sub(
-        r"!\[Test Coverage\]\(https://img\.shields\.io/badge/coverage-[^)]+\)",
-        f"![Test Coverage](https://img.shields.io/badge/coverage-{cov_str}%25-{cov_color}.svg)",
+        r"!\[Test Coverage\]\(https://img\.shields\.io/badge/(?:test_)?coverage-[^)]+\)",
+        f"![Test Coverage](https://img.shields.io/badge/test_coverage-{cov_str}%25-{cov_color}.svg)",
         content,
     )
     content = re.sub(
-        r"!\[Doc Coverage\]\(https://img\.shields\.io/badge/docs-[^)]+\)",
-        f"![Doc Coverage](https://img.shields.io/badge/docs-{doc_str}%25-{doc_color}.svg)",
+        r"!\[Doc Coverage\]\(https://img\.shields\.io/badge/(?:doc_coverage|docs)-[^)]+\)",
+        f"![Doc Coverage](https://img.shields.io/badge/doc_coverage-{doc_str}%25-{doc_color}.svg)",
         content,
     )
     if "![API Compliance]" in content:

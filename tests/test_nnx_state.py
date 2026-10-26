@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Union
 
 import pytest
 import zero_chex
@@ -18,7 +19,9 @@ from zero_optax.base import ExtraArgValue
 from zero_flax.core import FrozenDict, freeze
 from zero_flax.nnx import (
     BatchStat,
+    Dict,
     Linear,
+    List,
     LoRAParam,
     Module,
     Optimizer,
@@ -26,12 +29,16 @@ from zero_flax.nnx import (
     OptVariable,
     Param,
     RngCount,
+    Sequential,
     State,
+    clone,
     merge,
     restore_state,
     save_state,
+    split,
 )
 from zero_flax.nnx.state import (
+    VARIABLE_TYPE_TAG,
     _coerce_leaf_to_variable_value,
     _coerce_metadata_dict,
     _state_to_chex_pytree,
@@ -139,6 +146,31 @@ def test_state_strict_shapes_and_chex_integration() -> None:
     lin.update(valid_update, kernel=Param(jnp.ones((2, 3))), strict_shapes=True)
     lin.update(valid_update, strict_shapes=True)
 
+    # Partial state update (nested child and subset of keys) with strict_shapes=True
+    class NestedLin(Module):
+        """Module wrapping a Linear child and a BatchStat."""
+
+        child: Linear
+        stat: BatchStat[int]
+
+        def __init__(self) -> None:
+            """Initialize NestedLin."""
+            super().__init__()
+            self.child = self.register_child("child", Linear(2, 3))
+            self.stat = self.register_variable("stat", BatchStat(1))
+            self.finish_init()
+
+    nested_lin = NestedLin()
+    partial_params, _ = nested_lin.state().split(Param)
+    nested_lin.update(partial_params, strict_shapes=True)
+
+    cloned_lin = clone(nested_lin)
+    assert isinstance(cloned_lin, NestedLin)
+    assert cloned_lin.child.kernel is not nested_lin.child.kernel
+
+    with pytest.raises(AssertionError):
+        lin.update(State({"nonexistent": Param(jnp.ones((1,)))}), strict_shapes=True)
+
     bad_state = State({"kernel": Param(jnp.ones((4, 5))), "bias": Param(jnp.zeros((3,)))})
     with pytest.raises(AssertionError):
         lin.update(bad_state, strict_shapes=True)
@@ -165,7 +197,7 @@ def test_state_optax_and_pure_dict_conversions() -> None:
         {
             "layer": State(
                 {
-                    "w": Param(jnp.ones((2, 2)), sharding=("data",)),
+                    "w": Param(jnp.ones((2, 2)), sharding=("data",), axes=(0, 1), trainable=True),
                     "b": BatchStat([1.0, 2.0]),
                     "none_v": Param(None),
                     "scalar_v": Param(2.5),
@@ -222,6 +254,8 @@ def test_state_optax_and_pure_dict_conversions() -> None:
             "v1": Param(jnp.ones((2,))),
             "v2": LoRAParam(jnp.zeros((2,))),
             "nested": {"__zero_flax_state__": True, "entries": {"k": jnp.ones((1,))}},
+            "legacy_var": {"__zero_flax_variable__": True, "var_type": "BatchStat", "value": 1.0},
+            "new_tag_var": {VARIABLE_TYPE_TAG: "Param", "value": 2.0, "metadata": {"axes": (0, 1)}},
             "plain": jnp.ones((1,)),
             "sub": State({"z": Param(1.0)}),
             "str_cnt": {"__variable_type__": "RngCount", "value": "not_int", "metadata": {}},
@@ -231,8 +265,99 @@ def test_state_optax_and_pure_dict_conversions() -> None:
     assert isinstance(restored_var_direct["v1"], Param)
     assert isinstance(restored_var_direct["v2"], LoRAParam)
     assert isinstance(restored_var_direct["nested"], State)
+    assert isinstance(restored_var_direct["legacy_var"], BatchStat)
+    assert isinstance(restored_var_direct["new_tag_var"], Param)
     assert isinstance(restored_var_direct["plain"], Param)
     assert isinstance(restored_var_direct["sub"], State)
+
+
+def test_containers_state_synchronization() -> None:
+    """Verify Dict, List, and Sequential stay synchronized across split, update, and merge."""
+    d: Dict[Union[Module, Param[int], int, jnp.ndarray]] = Dict(
+        {"m": Linear(2, 2), "v": Param(3), "s": 7, "arr": jnp.ones((2,))}
+    )
+    assert d.setdefault("s", 9) == 7
+    assert d.setdefault("new_s", 11) == 11
+    d_gdef, d_state = split(d)
+    d_state["v"] = Param(42)
+    d_state["dyn_v"] = Param(99)
+    d.update(d_state, s=15)
+    assert isinstance(d["v"], Param) and d["v"].value == 42
+    assert isinstance(d["dyn_v"], Param) and d["dyn_v"].value == 99
+    assert d["s"] == 15
+    d_merged = merge(d_gdef, d_state)
+    assert isinstance(d_merged["v"], Param) and d_merged["v"].value == 42
+
+    lst: List[Union[Module, Param[int], int, jnp.ndarray, None]] = List(
+        [Linear(2, 2), Param(5), 10, jnp.ones((1,))]
+    )
+    assert len(lst) == 4
+    assert list(lst) == [lst[0], lst[1], 10, lst[3]]
+    assert 10 in lst
+    assert lst[:2] == [lst[0], lst[1]]
+    lst[2] = 11
+    assert lst[2] == 11
+    lst.set_at(1, Param(6))
+    lst.set_at(2, 12)
+    assert isinstance(lst[1], Param) and lst[1].value == 6
+    lst += [20]
+    lst.append(25)
+    assert len(lst) == 6
+    lst2 = lst + [30]
+    assert len(lst2) == 7
+    assert lst.equals(list(lst))
+    assert lst.equals(List(list(lst)))
+    lst.remove(20)
+    lst.remove(25)
+    assert len(lst) == 4
+    lst.reverse()
+    assert isinstance(lst[1], int) and lst[1] == 12
+    lst.reverse()
+    lst.delete_at(3)
+    lst.delete_at(2)
+    assert len(lst) == 2
+
+    l_gdef, l_state = split(lst)
+    l_state["1"] = Param(77)
+    l_state["2"] = Param(88)
+    lst.update(l_state, **{"3": 100})
+    assert isinstance(lst[1], Param) and lst[1].value == 77
+    assert isinstance(lst[2], Param) and lst[2].value == 88
+    assert lst[3] == 100
+    l_merged = merge(l_gdef, l_state)
+    assert isinstance(l_merged[1], Param) and l_merged[1].value == 77
+
+    with pytest.raises(KeyError, match="Invalid non-integer index key"):
+        lst.update(State({"bad_key": Param(1)}))
+
+    empty_lst: List[Param[int]] = List()
+    empty_lst._on_state_updated()
+    assert len(empty_lst) == 0
+
+    seq = Sequential(
+        Linear(2, 2),
+        lambda x: (x, x),
+        lambda a, b: a + b,
+        lambda x: (x, x),
+        lambda pair: pair[0] if isinstance(pair, tuple) else pair,
+    )
+    assert len(seq) == 5
+    assert seq[0] is seq.layers[0]
+    assert list(seq) == seq.layers
+    s_gdef, s_state = split(seq)
+    seq_merged = merge(s_gdef, s_state)
+    out = seq_merged(jnp.ones((1, 2)))
+    assert isinstance(out, jnp.ndarray) and out.shape == (1, 2)
+    out_with_args = seq(jnp.ones((1, 2)))
+    assert isinstance(out_with_args, jnp.ndarray)
+    seq_tuple_start = Sequential(lambda x, y: x + y)
+    assert jnp.all(
+        jnp.asarray(seq_tuple_start(jnp.ones((1, 2)), jnp.ones((1, 2)))) == jnp.full((1, 2), 2.0)
+    )
+
+    opt_raw = Optimizer(Linear(2, 2), zero_optax.sgd(0.1))
+    opt_raw.update({"kernel": jnp.ones((2, 2)), "bias": jnp.ones((2,))})
+    assert int(jnp.asarray(opt_raw.step.value).item()) == 1
 
 
 def test_nnx_optimizer_all_12_optax_optimizers_and_orbax_roundtrip(tmp_path: Path) -> None:

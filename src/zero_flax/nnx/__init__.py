@@ -161,6 +161,9 @@ from zero_flax.nnx.module import (
     Module as Module,
 )
 from zero_flax.nnx.module import (
+    clone as clone,
+)
+from zero_flax.nnx.module import (
     iter_graph as iter_graph,
 )
 from zero_flax.nnx.module import (
@@ -437,6 +440,7 @@ __all__ = [
     "Vmap",
     "WeightNorm",
     "celu",
+    "clone",
     "dot_product_attention",
     "elu",
     "filterlib",

@@ -42,7 +42,8 @@ InitArgValue: TypeAlias = Union[
 ]
 InitArgsType: TypeAlias = Optional[Sequence[InitArgValue]]
 InitKwargsType: TypeAlias = Optional[Mapping[str, InitArgValue]]
-TransformOutput: TypeAlias = Union[JaxArray, Tuple[JaxArray, ...]]
+CarryStruct: TypeAlias = Union[JaxArray, Tuple[JaxArray, ...]]
+TransformOutput: TypeAlias = Union[JaxArray, Tuple[Union[JaxArray, Tuple[JaxArray, ...]], ...]]
 
 
 class TransformTargetProtocol(Protocol):
@@ -50,9 +51,13 @@ class TransformTargetProtocol(Protocol):
 
     def __call__(
         self,
-        *args: ArrayLike,
+        *args: Union[ArrayLike, Tuple[ArrayLike, ...]],
         **kwargs: ArrayLike,
-    ) -> Union[Module, ArrayLike, Tuple[ArrayLike, ...]]:
+    ) -> Union[
+        Module,
+        ArrayLike,
+        Tuple[Union[ArrayLike, Tuple[ArrayLike, ...]], ...],
+    ]:
         """Invoke the target callable or module constructor.
 
         Args:
@@ -297,9 +302,23 @@ def _is_callable_target(
     return callable(instance)
 
 
+def _coerce_carry_struct(raw_carry: Union[ArrayLike, Tuple[ArrayLike, ...]]) -> CarryStruct:
+    """Coerce a single array or tuple of arrays into a ``CarryStruct``.
+
+    Args:
+        raw_carry: Single array or tuple of arrays representing a recurrent carry.
+
+    Returns:
+        ``JaxArray`` or ``Tuple[JaxArray, ...]`` preserving tuple structure.
+    """
+    if isinstance(raw_carry, tuple):
+        return tuple(ensure_array(item) for item in raw_carry)
+    return ensure_array(raw_carry)
+
+
 def _call_wrapped(
     instance: WrappedCallableType,
-    *args: ArrayLike,
+    *args: Union[ArrayLike, Tuple[ArrayLike, ...]],
     **kwargs: ArrayLike,
 ) -> TransformOutput:
     """Invoke a wrapped ``Module`` or callable with ``*args`` and ``**kwargs``.
@@ -319,7 +338,7 @@ def _call_wrapped(
         raise TypeError(f"Wrapped transformation target {instance!r} is not callable.")
     raw_res = instance(*args, **kwargs)
     if isinstance(raw_res, tuple):
-        return tuple(ensure_array(item) for item in raw_res)
+        return tuple(_coerce_carry_struct(item) for item in raw_res)
     if isinstance(raw_res, Module):
         raise TypeError(
             f"Wrapped transformation target {instance!r} returned a Module instead of an ArrayLike."
@@ -345,17 +364,21 @@ def _stack_step_results(
     if isinstance(first_res, tuple):
         tuple_steps = [s for s in step_results if isinstance(s, tuple)]
         num_tuple_elems = len(first_res)
-        stacked_tuple: list[JaxArray] = []
+        stacked_tuple: list[Union[JaxArray, Tuple[JaxArray, ...]]] = []
         for t_i in range(num_tuple_elems):
             elem_axis = (
                 out_axes[t_i]
                 if isinstance(out_axes, Sequence) and t_i < len(out_axes)
                 else (None if out_axes is None else default_ax)
             )
-            if elem_axis is None:
-                stacked_tuple.append(first_res[t_i])
+            first_elem = first_res[t_i]
+            if elem_axis is None or isinstance(first_elem, tuple):
+                stacked_tuple.append(first_elem)
             else:
-                pieces = [jnp.expand_dims(step_r[t_i], axis=elem_axis) for step_r in tuple_steps]
+                pieces = [
+                    jnp.expand_dims(ensure_array(step_r[t_i]), axis=elem_axis)
+                    for step_r in tuple_steps
+                ]
                 stacked_tuple.append(jnp.concatenate(pieces, axis=elem_axis))
         return tuple(stacked_tuple)
 
@@ -725,9 +748,9 @@ class Scan(Module):
 
     def __call__(
         self,
-        *args: ArrayLike,
+        *args: Union[ArrayLike, Tuple[ArrayLike, ...]],
         **kwargs: ArrayLike,
-    ) -> Union[JaxArray, Tuple[JaxArray, ...]]:
+    ) -> TransformOutput:
         """Execute the scanned loop over ``*args``.
 
         Args:
@@ -756,12 +779,13 @@ class Scan(Module):
             for idx in indices:
                 step_x = _slice_along_axis(xs, ax, idx)
                 step_res = _call_wrapped(self.wrapped_module, step_x, **kwargs)
-                step_y = step_res[0] if isinstance(step_res, tuple) else step_res
+                step_first = step_res[0] if isinstance(step_res, tuple) else step_res
+                step_y = step_first[0] if isinstance(step_first, tuple) else step_first
                 step_outs.append(jnp.expand_dims(step_y, axis=ax))
             return jnp.concatenate(step_outs, axis=ax)
 
         carry_idx = self.carry_argnum if 0 <= self.carry_argnum < len(args) else 0
-        carry = ensure_array(args[carry_idx])
+        carry: CarryStruct = _coerce_carry_struct(args[carry_idx])
         scanned_indices = [i for i in range(len(args)) if i != carry_idx]
         scanned_arrays: list[JaxArray] = []
         for s_i in scanned_indices:
@@ -779,9 +803,10 @@ class Scan(Module):
         out_ax = norm_out_ax if norm_out_ax <= first_xs.ndim else 0
         seq_len = self.length if self.length is not None else first_xs.shape[ax]
         if seq_len == 0:
-            empty_shape = list(carry.shape)
+            ref_c = carry[0] if isinstance(carry, tuple) else carry
+            empty_shape = list(ref_c.shape)
             empty_shape.insert(out_ax, 0)
-            c_dt = sanitize_dtype_str(str(carry.dtype).lower())
+            c_dt = sanitize_dtype_str(str(ref_c.dtype).lower())
             empty_out: JaxArray = jnp.zeros(tuple(empty_shape), dtype=c_dt)
             if self.scan_output:
                 return carry, empty_out
@@ -799,7 +824,7 @@ class Scan(Module):
             step_x = sliced_xs[0]
             if _is_callable_target(self.wrapped_module):
                 if accepts_two:
-                    call_args: list[JaxArray] = list(sliced_xs)
+                    call_args: list[Union[ArrayLike, Tuple[ArrayLike, ...]]] = list(sliced_xs)
                     call_args.insert(carry_idx, carry)
                     raw_out = self.wrapped_module(*call_args, **kwargs)
                 else:
@@ -807,13 +832,13 @@ class Scan(Module):
             else:
                 raw_out = step_x
             if isinstance(raw_out, tuple) and len(raw_out) == 2:
-                carry = ensure_array(raw_out[0])
+                carry = _coerce_carry_struct(raw_out[0])
                 step_y = ensure_array(raw_out[1])
             elif not isinstance(raw_out, (Module, tuple)):
                 carry = ensure_array(raw_out)
                 step_y = carry
             else:
-                step_y = carry
+                step_y = carry[0] if isinstance(carry, tuple) else carry
             ys.append(jnp.expand_dims(step_y, axis=out_ax))
 
         stacked = jnp.concatenate(ys, axis=out_ax)
@@ -910,18 +935,25 @@ class Pmap(Module):
 
         Returns:
             Device-mapped output ``JaxArray`` or tuple of ``JaxArray``s.
+
+        Raises:
+            ValueError: If non-broadcasted input arguments have inconsistent device axis sizes.
         """
         if len(args) == 0 and self.axis_size is None:
             return _call_wrapped(self.wrapped_module, **kwargs)
 
         arr_args = [ensure_array(a) for a in args]
         num_devices: Optional[int] = self.axis_size
-        if num_devices is None:
-            for arg_idx, arr_a in enumerate(arr_args):
-                if arg_idx not in self.static_broadcasted_argnums and arr_a.ndim > 0:
-                    norm_ax = self.in_axes if self.in_axes >= 0 else arr_a.ndim + self.in_axes
-                    num_devices = arr_a.shape[norm_ax]
-                    break
+        for arg_idx, arr_a in enumerate(arr_args):
+            if arg_idx not in self.static_broadcasted_argnums and arr_a.ndim > 0:
+                norm_ax = self.in_axes if self.in_axes >= 0 else arr_a.ndim + self.in_axes
+                dim_sz = arr_a.shape[norm_ax]
+                if num_devices is None:
+                    num_devices = dim_sz
+                elif dim_sz != num_devices:
+                    raise ValueError(
+                        f"Pmap got inconsistent device axis sizes: expected {num_devices}, got {dim_sz}."
+                    )
         if num_devices is None:
             return _call_wrapped(self.wrapped_module, *args, **kwargs)
 

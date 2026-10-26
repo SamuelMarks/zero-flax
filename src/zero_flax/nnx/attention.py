@@ -64,6 +64,8 @@ def _compute_attention_weights(
     dropout_rng: PRNGKeyLike = None,
     dropout_rate: float = 0.0,
     deterministic: bool = False,
+    scale: Optional[float] = None,
+    is_causal: bool = False,
 ) -> JaxArray:
     """Compute normalized (and optionally dropped-out) attention weights.
 
@@ -76,17 +78,26 @@ def _compute_attention_weights(
         dropout_rng: Optional PRNG key for attention dropout.
         dropout_rate: Attention dropout probability.
         deterministic: Whether dropout is disabled.
+        scale: Optional explicit scaling factor for queries (defaults to ``1 / sqrt(head_dim)``).
+        is_causal: Whether to apply a lower-triangular causal attention mask.
 
     Returns:
         Attention weight tensor of shape ``(*batch, num_heads, q_len, kv_len)``.
     """
     head_dim = max(1, int(q_b.shape[-1]))
-    scale = 1.0 / math.sqrt(float(head_dim))
-    q_scaled = q_b * scale
+    eff_scale = float(scale) if scale is not None else (1.0 / math.sqrt(float(head_dim)))
+    q_scaled = q_b * eff_scale
 
     logits: JaxArray = jnp.einsum("...qhd,...khd->...hqk", q_scaled, k_b)
     if bias is not None:
         logits = logits + ensure_array(bias)
+    if is_causal:
+        q_len = int(q_b.shape[-3])
+        kv_len = int(k_b.shape[-3])
+        q_idx = jnp.reshape(jnp.arange(q_len), (q_len, 1))
+        k_idx = jnp.reshape(jnp.arange(kv_len), (1, kv_len))
+        causal_mask = k_idx <= q_idx
+        logits = jnp.where(causal_mask, logits, -1e9)
     if mask is not None:
         mask_arr = ensure_array(mask)
         logits = jnp.where(mask_arr, logits, -1e9)
@@ -117,6 +128,9 @@ def dot_product_attention(
     dtype: Optional[DType] = None,
     precision: PrecisionSpec = None,
     module: Optional[Module] = None,
+    *,
+    scale: Optional[float] = None,
+    is_causal: bool = False,
 ) -> JaxArray:
     r"""Compute scaled dot-product attention ``softmax(Q K^T / sqrt(d_k) + B) V``.
 
@@ -133,6 +147,8 @@ def dot_product_attention(
         dtype: Optional computation data type.
         precision: Optional contraction precision specification.
         module: Optional calling ``Module`` instance in which to sow ``attention_weights``.
+        scale: Optional explicit scaling factor for queries (defaults to ``1 / sqrt(head_dim)``).
+        is_causal: Whether to apply a lower-triangular causal attention mask.
 
     Returns:
         Attended value ``JaxArray`` of the same shape as ``query``.
@@ -169,6 +185,8 @@ def dot_product_attention(
         dropout_rng=dropout_rng,
         dropout_rate=dropout_rate,
         deterministic=deterministic,
+        scale=scale,
+        is_causal=is_causal,
     )
     if module is not None:
         sown = weights[0] if squeeze_batch else weights
@@ -470,7 +488,16 @@ class MultiHeadAttention(Module):
         Args:
             input_shape: Sequence ``(*batch_dims, max_length, in_features)``.
             dtype: Data type for cached key and value tensors.
+
+        Raises:
+            ValueError: If ``input_shape`` has fewer than 2 dimensions or its last
+                dimension does not match ``self.in_features``.
         """
+        if len(input_shape) < 2 or int(input_shape[-1]) != self.in_features:
+            raise ValueError(
+                f"init_cache expects input_shape (*batch, max_length, {self.in_features}), "
+                f"got {tuple(input_shape)}."
+            )
         cache_shape = (*tuple(int(d) for d in input_shape[:-1]), self.num_kv_heads, self.head_dim)
         self.cached_key = self.register_variable(
             "cached_key",

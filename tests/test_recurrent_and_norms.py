@@ -144,14 +144,40 @@ def test_rnn_and_bidirectional_options() -> None:
     (fc, bc), bi_out = bi(
         np.ones((2, 4, 2), dtype=np.float32),
         initial_carry=(init_c, init_c),
+        seq_lengths=np.array([2, 4], dtype=np.int32),
     )
     assert np.asarray(fc).shape == (2, 3)
     assert np.asarray(bc).shape == (2, 3)
     np.testing.assert_allclose(
-        np.asarray(bi_out),
-        2.0 * np.tanh(np.full((2, 4, 3), 2.0, dtype=np.float32)),
+        np.asarray(bi_out[1]),
+        2.0 * np.tanh(np.full((4, 3), 2.0, dtype=np.float32)),
         rtol=1e-5,
     )
+    np.testing.assert_allclose(
+        np.asarray(bi_out[0, 2:]),
+        np.zeros((2, 3), dtype=np.float32),
+        atol=1e-5,
+    )
+
+    lstm_rnn = nnx.RNN(nnx.LSTMCell(2, 3), return_carry=True)
+    (lc_fin, lh_fin), l_seq_out = lstm_rnn(
+        np.ones((2, 3, 2), dtype=np.float32),
+        seq_lengths=np.array([1, 3], dtype=np.int32),
+    )
+    assert np.asarray(lc_fin).shape == (2, 3)
+    assert np.asarray(lh_fin).shape == (2, 3)
+    np.testing.assert_allclose(
+        np.asarray(l_seq_out[0, 1:]),
+        np.zeros((2, 3), dtype=np.float32),
+        atol=1e-5,
+    )
+
+    scan_lstm = nnx.Scan(nnx.LSTMCell(2, 3), in_axes=1, out_axes=1)
+    init_lstm_c = nnx.LSTMCell(2, 3).initialize_carry((2, 2))
+    (sc_c, sc_h), sc_out = scan_lstm(init_lstm_c, np.ones((2, 4, 2), dtype=np.float32))
+    assert np.asarray(sc_c).shape == (2, 3)
+    assert np.asarray(sc_h).shape == (2, 3)
+    assert np.asarray(sc_out).shape == (2, 4, 3)
 
 
 def test_groupnorm_and_instancenorm_branches() -> None:
@@ -194,6 +220,12 @@ def test_groupnorm_and_instancenorm_branches() -> None:
 
     with pytest.raises(ValueError, match="num_groups"):
         nnx.GroupNorm(num_features=5, num_groups=2)
+
+    with pytest.raises(ValueError, match="GroupNorm input channel dimension"):
+        gn_gs(np.ones((1, 2, 4), dtype=np.float32))
+
+    ln_axis = nnx.LayerNorm(2, axis_name="batch")
+    assert ln_axis(np.array([[1.0, 3.0]], dtype=np.float32)).shape == (1, 2)
 
     inorm_no = nnx.InstanceNorm(
         num_features=3,
@@ -319,8 +351,11 @@ def test_spectral_and_weight_norm_branches() -> None:
     wn_empty = nnx.WeightNorm(empty_mod)
     assert wn_empty(np.ones((2, 2), dtype=np.float32)).shape == (2, 2)
 
-    sn_no_update = nnx.SpectralNorm(nnx.Linear(2, 2), update_stats=False)
+    sn_no_update = nnx.SpectralNorm(nnx.Linear(2, 2), update_stats=False, rngs=nnx.Rngs(0))
     assert sn_no_update(np.ones((1, 2), dtype=np.float32)).shape == (1, 2)
+
+    wn_nested = nnx.WeightNorm(nnx.Sequential(nnx.Linear(2, 2), nnx.Linear(2, 2)))
+    assert wn_nested(np.ones((1, 2), dtype=np.float32)).shape == (1, 2)
 
     wn_no_scale = nnx.WeightNorm(
         nnx.Linear(2, 3), use_scale=False, promote_dtype=None, dtype="float32"
@@ -462,5 +497,7 @@ def test_rope_and_attention_branches() -> None:
         broadcast_dropout=False,
         dropout_rate=0.2,
         deterministic=False,
+        scale=0.5,
+        is_causal=True,
     )
     assert dpa.shape == (2, 2, 2)

@@ -7,7 +7,7 @@ parent module registries without dynamic reflection or `Any`.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from typing import (
     Generic,
     Optional,
@@ -23,7 +23,7 @@ from typing_extensions import TypeAlias, TypeGuard
 
 from zero_flax.nnx.module import Module
 from zero_flax.nnx.variables import AnyVariable, Variable, VariableBase
-from zero_flax.types import ArrayLike, JaxArray
+from zero_flax.types import ArrayLike, JaxArray, MetadataValue
 
 
 @runtime_checkable
@@ -35,8 +35,8 @@ class LayerCallableProtocol(Protocol):
         x: ArrayLike,
         *args: ArrayLike,
         **kwargs: ArrayLike,
-    ) -> ArrayLike:
-        """Transform ``x`` and return an ``ArrayLike`` output.
+    ) -> Union[ArrayLike, Tuple[ArrayLike, ...]]:
+        """Transform ``x`` and return an ``ArrayLike`` or tuple output.
 
         Args:
             x: Input array or scalar.
@@ -44,7 +44,7 @@ class LayerCallableProtocol(Protocol):
             **kwargs: Optional additional keyword arguments.
 
         Returns:
-            Transformed output.
+            Transformed output array or tuple of arrays.
         """
 
 
@@ -55,6 +55,7 @@ ContainerItem: TypeAlias = Union[
     LayerCallableProtocol,
     JaxArray,
     ArrayLike,
+    MetadataValue,
     int,
     float,
     str,
@@ -62,6 +63,19 @@ ContainerItem: TypeAlias = Union[
     None,
 ]
 ItemT = TypeVar("ItemT", bound=ContainerItem)
+
+
+def _is_typed_item(val: ContainerItem) -> TypeGuard[ItemT]:
+    """Narrow a ``ContainerItem`` registry entry to ``ItemT``.
+
+    Args:
+        val: Registry item to narrow.
+
+    Returns:
+        ``True``.
+    """
+    _ = val
+    return True
 
 
 class Dict(Module, Generic[ItemT]):
@@ -98,8 +112,17 @@ class Dict(Module, Generic[ItemT]):
             self[k] = v
         self.finish_init()
 
+    def _on_state_updated(self) -> None:
+        """Synchronize ``self._data`` after ``update()`` or ``merge()`` mutates registries."""
+        raw_updates: list[Tuple[str, ContainerItem]] = [
+            *self._children.items(),
+            *self._variables.items(),
+            *self._static_config.items(),
+        ]
+        self._data.update({k: v for k, v in raw_updates if _is_typed_item(v)})
+
     def __setitem__(self, key: str, value: ItemT) -> None:
-        """Store ``value`` under ``key`` and synchronize child/variable registries.
+        """Store ``value`` under ``key`` and synchronize child/variable/static registries.
 
         Args:
             key: String dictionary key.
@@ -109,11 +132,14 @@ class Dict(Module, Generic[ItemT]):
         str_key = str(key)
         self._children.pop(str_key, None)
         self._variables.pop(str_key, None)
+        self._static_config.pop(str_key, None)
         self._data[str_key] = value
         if isinstance(value, Module):
             self.register_child(str_key, value)
         elif isinstance(value, Variable):
             self.register_variable(str_key, value)
+        elif isinstance(value, (str, int, float, bool, tuple)) or value is None:
+            self.register_static(str_key, value)
 
     def __getitem__(self, key: str) -> ItemT:
         """Retrieve the item stored under ``key``.
@@ -127,7 +153,7 @@ class Dict(Module, Generic[ItemT]):
         return self._data[str(key)]
 
     def __delitem__(self, key: str) -> None:
-        """Delete ``key`` from the container and remove it from child/variable registries.
+        """Delete ``key`` from the container and remove it from child/variable/static registries.
 
         Args:
             key: String dictionary key to delete.
@@ -136,6 +162,7 @@ class Dict(Module, Generic[ItemT]):
         del self._data[str_key]
         self._children.pop(str_key, None)
         self._variables.pop(str_key, None)
+        self._static_config.pop(str_key, None)
 
     def get(self, key: str, default: Optional[ItemT] = None) -> Optional[ItemT]:
         """Return the item for ``key`` if present, else ``default``.
@@ -150,6 +177,21 @@ class Dict(Module, Generic[ItemT]):
         if key in self._data:
             return self[key]
         return default
+
+    def setdefault(self, key: str, default: ItemT) -> ItemT:
+        """Return ``self[key]`` if ``key`` is present, otherwise insert ``default`` and return it.
+
+        Args:
+            key: String dictionary key.
+            default: Value to insert and return when ``key`` is not present.
+
+        Returns:
+            Existing or newly inserted item.
+        """
+        str_key = str(key)
+        if str_key not in self._data:
+            self[str_key] = default
+        return self[str_key]
 
     def pop(self, key: str, default: Optional[ItemT] = None) -> Optional[ItemT]:
         """Remove ``key`` and return its value, or ``default`` if absent.
@@ -169,10 +211,11 @@ class Dict(Module, Generic[ItemT]):
         return default
 
     def clear(self) -> None:
-        """Remove all items from the Dict container and clear child/variable registries."""
+        """Remove all items from the Dict container and clear child/variable/static registries."""
         self._data.clear()
         self._children.clear()
         self._variables.clear()
+        self._static_config.clear()
 
     def keys(self) -> list[str]:
         """Return a list of keys in the Dict container.
@@ -229,6 +272,9 @@ class Dict(Module, Generic[ItemT]):
 class List(Module, list[ItemT], Generic[ItemT]):
     """List container module registering ``Module`` and ``Variable`` elements in NNX state.
 
+    Synchronizes sequence elements with ``_children``, ``_variables``, and ``_static_config``
+    across all sequence mutations as well as ``split``, ``merge``, and ``update``.
+
     Attributes:
         _pytree__has_int_keys: Internal Flax NNX pytree compatibility flag.
     """
@@ -248,25 +294,77 @@ class List(Module, list[ItemT], Generic[ItemT]):
             _pytree__has_int_keys: Pytree integer-key marker matching ``flax.nnx.List``.
         """
         Module.__init__(self)
-        list.__init__(self)
         self._allows_dynamic_variables = True
         self._pytree__has_int_keys = bool(_pytree__has_int_keys)
         if it is not None:
-            for item in it:
-                self.append(item)
+            list.__init__(self, it)
+        else:
+            list.__init__(self)
+        self._rebuild_registries()
         self.finish_init()
 
     def _rebuild_registries(self) -> None:
-        """Rebuild ``_children`` and ``_variables`` from the current list contents in index order."""
+        """Rebuild ``_children``, ``_variables``, and ``_static_config`` from ``self``."""
         self._ensure_registries()
         self._children.clear()
         self._variables.clear()
-        for idx, item in enumerate(list.__iter__(self)):
+        self._static_config.clear()
+        for idx, item in enumerate(self):
             key = str(idx)
             if isinstance(item, Module):
                 self.register_child(key, item)
             elif isinstance(item, Variable):
                 self.register_variable(key, item)
+            elif isinstance(item, (str, int, float, bool, tuple)) or item is None:
+                self.register_static(key, item)
+
+    def _on_state_updated(self) -> None:
+        """Synchronize sequence elements after ``update()`` or ``merge()`` mutates registries.
+
+        Raises:
+            KeyError: If any updated state key in ``_children``, ``_variables``, or
+                ``_static_config`` is not a non-negative integer string index.
+        """
+        indexed_updates: dict[int, ContainerItem] = {}
+        for idx, existing in enumerate(self):
+            indexed_updates[idx] = existing
+
+        all_keys = (
+            set(self._children.keys())
+            | set(self._variables.keys())
+            | set(self._static_config.keys())
+        )
+        for key in all_keys:
+            if not key.isdigit():
+                raise KeyError(f"Invalid non-integer index key {key!r} in List state update.")
+            idx = int(key)
+            if key in self._children:
+                indexed_updates[idx] = self._children[key]
+            elif key in self._variables:
+                indexed_updates[idx] = self._variables[key]
+            else:
+                indexed_updates[idx] = self._static_config[key]
+
+        if not indexed_updates:
+            list.clear(self)
+            return
+        max_idx = max(indexed_updates.keys())
+        raw_items: list[ContainerItem] = [indexed_updates.get(i) for i in range(max_idx + 1)]
+        rebuilt: list[ItemT] = [x for x in raw_items if _is_typed_item(x)]
+        list.clear(self)
+        list.extend(self, rebuilt)
+        self._rebuild_registries()
+
+    def equals(self, other: Union[List[ItemT], Sequence[ContainerItem]]) -> bool:
+        """Check structural equality against another ``List`` or ``Sequence``.
+
+        Args:
+            other: Comparison target ``List`` or ``Sequence``.
+
+        Returns:
+            ``True`` if elements match in order.
+        """
+        return list(self) == list(other)
 
     def append(self, value: ItemT) -> None:
         """Append ``value`` to the end of the list and synchronize module state.
@@ -305,12 +403,26 @@ class List(Module, list[ItemT], Generic[ItemT]):
         Returns:
             Removed element.
         """
-        removed = super().pop(index)
+        removed: ItemT = super().pop(index)
         self._rebuild_registries()
         return removed
 
+    def remove(self, value: ItemT) -> None:
+        """Remove the first occurrence of ``value`` and re-index registries.
+
+        Args:
+            value: Element value to remove.
+        """
+        super().remove(value)
+        self._rebuild_registries()
+
+    def reverse(self) -> None:
+        """Reverse the elements of the list in-place and re-index registries."""
+        super().reverse()
+        self._rebuild_registries()
+
     def clear(self) -> None:
-        """Remove all elements from the list and clear child/variable registries."""
+        """Remove all elements from the list and clear child/variable/static registries."""
         super().clear()
         self._rebuild_registries()
 
@@ -321,7 +433,7 @@ class List(Module, list[ItemT], Generic[ItemT]):
             index: Element index to replace.
             value: New element value.
         """
-        list.__setitem__(self, index, value)
+        super().__setitem__(index, value)
         self._rebuild_registries()
 
     def delete_at(self, index: int) -> None:
@@ -330,7 +442,7 @@ class List(Module, list[ItemT], Generic[ItemT]):
         Args:
             index: Element index to delete.
         """
-        list.__delitem__(self, index)
+        super().__delitem__(index)
         self._rebuild_registries()
 
 
@@ -380,17 +492,56 @@ class Sequential(Module):
                 self.register_child(f"layer_{idx}", fn)
         self.finish_init()
 
+    def _on_state_updated(self) -> None:
+        """Synchronize ``self.layers`` and ``self.fns`` with updated child modules."""
+        for idx in range(len(self.layers)):
+            key = f"layer_{idx}"
+            if key in self._children:
+                self.layers[idx] = self._children[key]
+        self.fns = tuple(self.layers)
+
+    def __len__(self) -> int:
+        """Return the number of layers in the Sequential container.
+
+        Returns:
+            Number of layers in ``self.layers``.
+        """
+        return len(self.layers)
+
+    def __getitem__(self, index: int) -> SequentialLayer:
+        """Retrieve the layer at ``index``.
+
+        Args:
+            index: Integer index into ``self.layers``.
+
+        Returns:
+            Layer or callable at ``index``.
+        """
+        return self.layers[index]
+
+    def __iter__(self) -> Iterator[SequentialLayer]:
+        """Iterate over the layers in ``self.layers``.
+
+        Returns:
+            Iterator of sequential layers.
+        """
+        return iter(self.layers)
+
     def __call__(
         self,
         x: ArrayLike,
         *args: ArrayLike,
         **kwargs: ArrayLike,
-    ) -> ArrayLike:
+    ) -> Union[ArrayLike, Tuple[ArrayLike, ...]]:
         """Apply all layers in ``self.layers`` sequentially to ``x``.
+
+        If a layer returns a ``tuple`` and no extra ``*args`` are supplied, the tuple
+        elements are unpacked as positional arguments to the next layer if it accepts
+        multiple positional arguments, matching Flax NNX ``Sequential`` behavior.
 
         Args:
             x: Initial input array passed to the first layer.
-            *args: Additional positional arguments forwarded to each layer.
+            *args: Additional positional arguments forwarded to the first (or each) layer.
             **kwargs: Additional keyword arguments forwarded to each layer.
 
         Returns:
@@ -399,11 +550,20 @@ class Sequential(Module):
         Raises:
             TypeError: If any layer in ``self.layers`` is not callable.
         """
-        cur: ArrayLike = x
-        for fn in self.layers:
+        cur: Union[ArrayLike, Tuple[ArrayLike, ...]] = x
+        for idx, fn in enumerate(self.layers):
             if not _as_layer_callable(fn):
                 raise TypeError(f"Sequential layer {fn!r} is not callable.")
-            cur = fn(cur, *args, **kwargs) if (args or kwargs) else fn(cur)
+            if idx == 0 and (args or kwargs):
+                first_in: ArrayLike = cur[0] if isinstance(cur, tuple) else cur
+                cur = fn(first_in, *args, **kwargs)
+            elif isinstance(cur, tuple):
+                try:
+                    cur = fn(cur[0], *cur[1:], **kwargs) if kwargs else fn(cur[0], *cur[1:])
+                except TypeError:
+                    cur = fn(cur, **kwargs) if kwargs else fn(cur)
+            else:
+                cur = fn(cur, *args, **kwargs) if (args or kwargs) else fn(cur)
         return cur
 
 
@@ -413,4 +573,5 @@ __all__ = [
     "ItemT",
     "List",
     "Sequential",
+    "Sequence",
 ]

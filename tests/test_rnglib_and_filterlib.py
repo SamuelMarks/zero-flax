@@ -371,10 +371,26 @@ def test_types_and_conv_branches() -> None:
 
     c_short = nnx.Conv(2, 2, kernel_size=(5,), padding="VALID")
     assert c_short(np.ones((1, 6, 2), dtype=np.float32)).shape == (1, 2, 2)
+    with pytest.raises(ValueError, match="Conv padded spatial size"):
+        c_short(np.ones((1, 3, 2), dtype=np.float32))
     with pytest.raises(ValueError, match="Conv expects input"):
         c_short(np.ones((2,), dtype=np.float32))
     with pytest.raises(ValueError, match="Conv input channel"):
         c_short(np.ones((1, 6, 3), dtype=np.float32))
+
+    c_circ_no_dil = nnx.Conv(2, 2, kernel_size=(3,), padding="CIRCULAR", input_dilation=(1,))
+    assert c_circ_no_dil(np.ones((1, 4, 2), dtype=np.float32)).shape == (1, 4, 2)
+    c_circ_zero_pad = nnx.Conv(2, 2, kernel_size=(1,), padding="CIRCULAR", input_dilation=(1,))
+    assert c_circ_zero_pad(np.ones((1, 4, 2), dtype=np.float32)).shape == (1, 4, 2)
+
+    ct_circ_s2 = nnx.ConvTranspose(
+        2, 2, kernel_size=(3,), strides=(2,), padding="CIRCULAR", use_bias=False
+    )
+    assert ct_circ_s2(np.ones((1, 3, 2), dtype=np.float32)).shape == (1, 6, 2)
+    ct_circ_s1 = nnx.ConvTranspose(
+        2, 2, kernel_size=(3,), strides=(1,), padding="CIRCULAR", use_bias=False
+    )
+    assert ct_circ_s1(np.ones((1, 3, 2), dtype=np.float32)).shape == (1, 3, 2)
 
     ct_valid = nnx.ConvTranspose(
         2,
@@ -422,6 +438,20 @@ def test_transforms_and_module_edge_branches() -> None:
         kernel_init=initializers.ones,
     )
     assert lg_batch_1(np.ones((1, 3), dtype=np.float32)).shape == (1, 4)
+
+    lg_no_batch = nnx.LinearGeneral(3, 4, axis=-1, batch_axis=None, use_bias=False)
+    assert lg_no_batch(np.ones((1, 3), dtype=np.float32)).shape == (1, 4)
+    lg_multi_in = nnx.LinearGeneral((2, 3), 4, axis=-1, use_bias=False)
+    assert lg_multi_in(np.ones((1, 2, 3), dtype=np.float32)).shape == (1, 4)
+    with pytest.raises(ValueError, match="axis length"):
+        nnx.LinearGeneral((2, 3), 4, axis=(-1,))
+
+    d_clr: nnx.Dict[int] = nnx.Dict({"a": 1})
+    d_clr.clear()
+    assert len(d_clr) == 0
+    l_clr: nnx.List[int] = nnx.List([1, 2])
+    l_clr.clear()
+    assert len(l_clr) == 0
 
     lora_plain = nnx.LoRA(2, 1, 2)
     assert lora_plain(np.ones((1, 2), dtype=np.float32)).shape == (1, 2)
@@ -661,3 +691,9 @@ def test_transforms_and_module_edge_branches() -> None:
     assert np.asarray(p_all_bcast(np.ones((2,), dtype=np.float32))).shape == (2,)
     p_axis_sz = nnx.Pmap(_inc_fn, axis_size=2, static_broadcasted_argnums=(0,))
     assert np.asarray(p_axis_sz(np.ones((3,), dtype=np.float32))).shape == (2, 3)
+    p_multi = nnx.Pmap(_inc_fn)
+    assert np.asarray(
+        p_multi(np.ones((2, 2), dtype=np.float32), np.ones((2, 2), dtype=np.float32))
+    ).shape == (2, 2)
+    with pytest.raises(ValueError, match="Pmap got inconsistent device axis sizes"):
+        p_multi(np.ones((2, 2), dtype=np.float32), np.ones((3, 2), dtype=np.float32))

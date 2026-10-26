@@ -10,7 +10,9 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Optional, Tuple, Union
 
+from zero_jax import lax
 from zero_jax import numpy as jnp
+from zero_jax import random as jrandom
 
 from zero_flax.nnx.filterlib import FilterLiteral, PathContains, to_predicate
 from zero_flax.nnx.module import Module, iter_graph
@@ -76,6 +78,47 @@ def _normalize_axes(axes: Union[Axes, int, Sequence[int], None], ndim: int) -> T
     return tuple(a if a >= 0 else max(0, ndim + a) for a in raw)
 
 
+def _assert_feature_dim(tensor: JaxArray, axis: int, expected: int) -> None:
+    """Validate that ``tensor`` has size ``expected`` along ``axis`` via ``zero_chex``.
+
+    Args:
+        tensor: Input ``JaxArray`` to validate.
+        axis: Axis index to check.
+        expected: Expected dimension size along ``axis``.
+    """
+    from zero_chex.assertions import assert_axis_dimension
+
+    assert_axis_dimension(tensor, axis, expected)
+
+
+def _aggregate_moments_across_devices(
+    mean: JaxArray,
+    var: JaxArray,
+    axis_name: Optional[str],
+    axis_index_groups: AxisIndexGroups,
+) -> Tuple[JaxArray, JaxArray]:
+    """Aggregate ``(mean, var)`` across parallel devices via ``zero_jax.lax.pmean``.
+
+    Args:
+        mean: Local mean tensor.
+        var: Local variance tensor.
+        axis_name: Optional parallel axis name.
+        axis_index_groups: Optional groups of device axis indices.
+
+    Returns:
+        Aggregated ``(mean, var)`` pair.
+    """
+    if axis_name is None:
+        return mean, var
+    agg_mean: JaxArray = ensure_array(
+        lax.pmean(mean, axis_name=axis_name, axis_index_groups=axis_index_groups)
+    )
+    agg_var: JaxArray = ensure_array(
+        lax.pmean(var, axis_name=axis_name, axis_index_groups=axis_index_groups)
+    )
+    return agg_mean, agg_var
+
+
 def _compute_moments(
     arr: JaxArray,
     red_axes: Tuple[int, ...],
@@ -83,6 +126,8 @@ def _compute_moments(
     keepdims: bool = True,
     subtract_mean: bool = True,
     use_fast_variance: bool = True,
+    axis_name: Optional[str] = None,
+    axis_index_groups: AxisIndexGroups = None,
 ) -> Tuple[JaxArray, JaxArray]:
     r"""Compute (optionally masked) mean and variance of ``arr`` along ``red_axes``.
 
@@ -94,6 +139,8 @@ def _compute_moments(
         subtract_mean: Whether to center ``arr`` by its mean when computing variance.
         use_fast_variance: If ``True`` and ``subtract_mean`` is ``True``, compute variance via
             $\max(0, \mathbb{E}[x^2] - \mathbb{E}[x]^2)$; otherwise compute $\mathbb{E}[(x - \mu)^2]$.
+        axis_name: Optional parallel axis name for ``lax.pmean`` aggregation.
+        axis_index_groups: Optional device index groups for ``lax.pmean``.
 
     Returns:
         Pair ``(mean, var)`` of ``JaxArray`` tensors.
@@ -112,7 +159,7 @@ def _compute_moments(
                 var = jnp.mean(diff * diff, axis=red_axes, keepdims=keepdims)
         else:
             var = jnp.mean(arr * arr, axis=red_axes, keepdims=keepdims)
-        return mean, var
+        return _aggregate_moments_across_devices(mean, var, axis_name, axis_index_groups)
 
     m_arr = ensure_array(mask, dtype="float32")
     m_b: JaxArray = jnp.zeros(arr.shape, dtype="float32") + m_arr
@@ -128,7 +175,7 @@ def _compute_moments(
             var = jnp.sum(diff * diff, axis=red_axes, keepdims=keepdims) / denom
     else:
         var = jnp.sum(arr * arr * m_b, axis=red_axes, keepdims=keepdims) / denom
-    return mean, var
+    return _aggregate_moments_across_devices(mean, var, axis_name, axis_index_groups)
 
 
 class BatchNorm(Module):
@@ -232,11 +279,11 @@ class BatchNorm(Module):
 
         self.mean = self.register_variable(
             "mean",
-            BatchStat(jnp.zeros((self.num_features,))),
+            BatchStat(ensure_array(jnp.zeros((self.num_features,)), dtype=param_dtype)),
         )
         self.var = self.register_variable(
             "var",
-            BatchStat(jnp.ones((self.num_features,))),
+            BatchStat(ensure_array(jnp.ones((self.num_features,)), dtype=param_dtype)),
         )
 
         if self.use_scale:
@@ -304,6 +351,7 @@ class BatchNorm(Module):
             else bool(self.use_running_average)
         )
         feat_axis = self.axis if self.axis >= 0 else max(0, arr.ndim + self.axis)
+        _assert_feature_dim(arr, feat_axis, self.num_features)
         reduction_axes = tuple(i for i in range(arr.ndim) if i != feat_axis)
 
         if use_ra:
@@ -319,6 +367,8 @@ class BatchNorm(Module):
                 use_fast_variance=bool(
                     True if self.use_fast_variance is None else self.use_fast_variance
                 ),
+                axis_name=self.axis_name,
+                axis_index_groups=self.axis_index_groups,
             )
             if self.subtract_mean:
                 self.mean.value = (
@@ -500,10 +550,14 @@ class LayerNorm(Module):
             keepdims=True,
             subtract_mean=True,
             use_fast_variance=self.use_fast_variance,
+            axis_name=self.axis_name,
+            axis_index_groups=self.axis_index_groups,
         )
         normed: JaxArray = (arr - mean) / jnp.sqrt(var + self.epsilon)
 
         feat_axes = _normalize_axes(self.feature_axes, arr.ndim)
+        for ax, exp_dim in zip(feat_axes, self.feature_shape):
+            _assert_feature_dim(arr, ax, exp_dim)
         bcast_shape = [1] * arr.ndim
         for ax in feat_axes:
             bcast_shape[ax] = arr.shape[ax]
@@ -644,10 +698,14 @@ class RMSNorm(Module):
             keepdims=True,
             subtract_mean=False,
             use_fast_variance=self.use_fast_variance,
+            axis_name=self.axis_name,
+            axis_index_groups=self.axis_index_groups,
         )
         normed: JaxArray = arr / jnp.sqrt(mean_sq + self.epsilon)
         if s_raw is not None:
             feat_axes = _normalize_axes(self.feature_axes, arr.ndim)
+            for ax, exp_dim in zip(feat_axes, self.feature_shape):
+                _assert_feature_dim(arr, ax, exp_dim)
             bcast_shape = [1] * arr.ndim
             for ax in feat_axes:
                 bcast_shape[ax] = arr.shape[ax]
@@ -806,6 +864,9 @@ class GroupNorm(Module):
 
         Returns:
             Group-normalized ``JaxArray`` of the same shape as ``x``.
+
+        Raises:
+            ValueError: If the last dimension of ``x`` does not match ``self.num_features``.
         """
         arr = ensure_array(x, dtype=self.dtype)
         s_raw: Optional[JaxArray] = (
@@ -826,6 +887,12 @@ class GroupNorm(Module):
             if b_raw is not None:
                 b_raw = promoted[2]
 
+        if arr.ndim == 0 or arr.shape[-1] != self.num_features:
+            raise ValueError(
+                f"GroupNorm input channel dimension ({arr.shape[-1] if arr.ndim > 0 else 'scalar'}) "
+                f"does not match num_features ({self.num_features})."
+            )
+        _assert_feature_dim(arr, -1, self.num_features)
         orig_shape = arr.shape
         grouped_shape = (*orig_shape[:-1], self.num_groups, self.group_size)
         grouped = jnp.reshape(arr, grouped_shape)
@@ -848,6 +915,8 @@ class GroupNorm(Module):
             keepdims=True,
             subtract_mean=True,
             use_fast_variance=self.use_fast_variance,
+            axis_name=self.axis_name,
+            axis_index_groups=self.axis_index_groups,
         )
         normed: JaxArray = jnp.reshape((grouped - mean) / jnp.sqrt(var + self.epsilon), orig_shape)
 
@@ -999,6 +1068,8 @@ class InstanceNorm(Module):
                 b_raw = promoted[2]
 
         feat_axes = _normalize_axes(self.feature_axes, arr.ndim)
+        for ax in feat_axes:
+            _assert_feature_dim(arr, ax, self.num_features)
         red_axes = tuple(i for i in range(1, arr.ndim) if i not in feat_axes)
         mean, var = _compute_moments(
             arr,
@@ -1007,6 +1078,8 @@ class InstanceNorm(Module):
             keepdims=True,
             subtract_mean=True,
             use_fast_variance=self.use_fast_variance,
+            axis_name=self.axis_name,
+            axis_index_groups=self.axis_index_groups,
         )
         normed: JaxArray = (arr - mean) / jnp.sqrt(var + self.epsilon)
 
@@ -1105,7 +1178,6 @@ class SpectralNorm(Module):
         self.param_dtype = param_dtype
         self.error_on_non_matrix = bool(error_on_non_matrix)
         self.update_stats = bool(update_stats)
-        _ = rngs
 
         kernel_var = _find_first_matrix_param(self.layer_instance)
         if kernel_var is not None:
@@ -1116,12 +1188,18 @@ class SpectralNorm(Module):
             cols = 1
             for d in k_arr.shape[1:]:
                 cols *= int(d)
-            self.u = self.register_variable(
-                "u", BatchStat(ensure_array(jnp.ones((rows,)) / (rows**0.5), dtype=param_dtype))
-            )
-            self.v = self.register_variable(
-                "v", BatchStat(ensure_array(jnp.ones((cols,)) / (cols**0.5), dtype=param_dtype))
-            )
+            if rngs is not None:
+                u_key = resolve_rng_key(rngs, "params", fold_index=0)
+                v_key = resolve_rng_key(rngs, "params", fold_index=1)
+                u_raw = jrandom.normal(u_key, (rows,), dtype=param_dtype)
+                v_raw = jrandom.normal(v_key, (cols,), dtype=param_dtype)
+                u_init = u_raw / jnp.sqrt(jnp.sum(u_raw * u_raw) + self.epsilon)
+                v_init = v_raw / jnp.sqrt(jnp.sum(v_raw * v_raw) + self.epsilon)
+            else:
+                u_init = ensure_array(jnp.ones((rows,)) / (rows**0.5), dtype=param_dtype)
+                v_init = ensure_array(jnp.ones((cols,)) / (cols**0.5), dtype=param_dtype)
+            self.u = self.register_variable("u", BatchStat(u_init))
+            self.v = self.register_variable("v", BatchStat(v_init))
         else:
             self.u = None
             self.v = None
@@ -1184,7 +1262,7 @@ class WeightNorm(Module):
         epsilon: Small constant added to the L2 norm for numerical stability.
         variable_filter: Filter selecting which parameter(s) of ``layer_instance`` to normalize.
         scale: Primary learnable magnitude ``Param`` ``g`` (for the first matched parameter).
-        scales: Dictionary mapping matched variable names to their respective ``Param`` scales.
+        scales: Dictionary mapping matched variable path keys to their respective ``Param`` scales.
     """
 
     layer_instance: Module
@@ -1242,21 +1320,24 @@ class WeightNorm(Module):
         predicate = to_predicate(self.variable_filter)
         s_fn = resolve_initializer(scale_init, ones_init)
         fold_idx = 0
-        for v_name, v_obj in self.layer_instance._variables.items():
-            if predicate((v_name,), v_obj) and self.use_scale:
-                k_arr = ensure_array(v_obj.value)
+        for path, node in iter_graph(self.layer_instance):
+            if isinstance(node, Param) and predicate(path, node) and self.use_scale:
+                path_key = ".".join(path)
+                k_arr = ensure_array(node.value)
                 f_axes = _normalize_axes(self.feature_axes, k_arr.ndim)
                 scale_shape = (
                     tuple(int(k_arr.shape[ax]) for ax in f_axes) if k_arr.ndim >= 1 else (1,)
                 )
                 s_key = resolve_rng_key(rngs, "params", fold_index=fold_idx)
                 fold_idx += 1
-                reg_name = "scale" if len(self.scales) == 0 else f"scale_{v_name}"
+                reg_name = "scale" if len(self.scales) == 0 else f"scale_{'_'.join(path)}"
                 s_param = self.register_variable(
                     reg_name,
                     Param(s_fn(s_key, scale_shape, param_dtype)),
                 )
-                self.scales[v_name] = s_param
+                self.scales[path_key] = s_param
+                if len(path) == 1:
+                    self.scales[path[0]] = s_param
                 if self.scale is None:
                     self.scale = s_param
         self.finish_init()
@@ -1272,13 +1353,14 @@ class WeightNorm(Module):
         """
         self.layer_instance._ensure_registries()
         predicate = to_predicate(self.variable_filter)
-        saved: dict[str, JaxArray] = {}
-        for v_name, v_obj in self.layer_instance._variables.items():
-            if predicate((v_name,), v_obj):
-                orig_w = ensure_array(v_obj.value)
-                saved[v_name] = orig_w
+        saved: list[Tuple[Param[JaxArray], JaxArray]] = []
+        for path, node in iter_graph(self.layer_instance):
+            if isinstance(node, Param) and predicate(path, node):
+                path_key = ".".join(path)
+                orig_w = ensure_array(node.value)
+                saved.append((node, orig_w))
                 w_work = ensure_array(orig_w, dtype=self.dtype)
-                s_param = self.scales.get(v_name, self.scale)
+                s_param = self.scales.get(path_key, self.scale)
                 s_val: Optional[JaxArray] = (
                     ensure_array(s_param.value, dtype=self.dtype)
                     if (self.use_scale and s_param is not None)
@@ -1305,13 +1387,13 @@ class WeightNorm(Module):
                     else:
                         s_b = s_val
                     normed_w = normed_w * s_b
-                v_obj.value = normed_w
+                node.value = normed_w
 
         try:
             out = _invoke_wrapped_layer(self.layer_instance, x)
         finally:
-            for v_name, orig_w in saved.items():
-                self.layer_instance._variables[v_name].value = orig_w
+            for param_node, orig_w in saved:
+                param_node.value = orig_w
         return out
 
 

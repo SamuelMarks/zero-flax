@@ -1,7 +1,7 @@
 """Reflection-free base Module, GraphDef, split, and merge system for zero-flax NNX.
 
 This module implements `Module`, `GraphDef`, `split`, `merge`, `update`, `state`,
-and `iter_graph` using explicit typed registries (`_variables`, `_children`,
+`clone`, and `iter_graph` using explicit typed registries (`_variables`, `_children`,
 `_static_config`) and deep blueprint cloning (`copy.deepcopy`), completely avoiding
 `getattr`, `setattr`, `hasattr`, `vars`, `__setattr__`, `__dict__`, `__new__`, and `Any`.
 """
@@ -13,7 +13,7 @@ from collections.abc import Iterator, Sequence
 from typing import Generic, Optional, Tuple, TypeVar, Union, overload
 
 from zero_flax.nnx.filterlib import FilterLiteral
-from zero_flax.nnx.state import State, StateEntry
+from zero_flax.nnx.state import State, StateEntry, _state_to_chex_pytree
 from zero_flax.nnx.state import merge as state_merge
 from zero_flax.nnx.variables import AnyVariable, Variable
 from zero_flax.types import MetadataValue
@@ -21,6 +21,27 @@ from zero_flax.types import MetadataValue
 M = TypeVar("M", bound="Module")
 ChildT = TypeVar("ChildT", bound="Module")
 VarT = TypeVar("VarT", bound=AnyVariable)
+
+
+def _filter_state_to_keys(reference: State, subset: State) -> State:
+    """Extract the subset of ``reference`` matching the keys present in ``subset``.
+
+    Args:
+        reference: Full reference ``State`` tree.
+        subset: Partial or complete ``State`` tree whose keys select entries from ``reference``.
+
+    Returns:
+        Filtered ``State`` containing only keys present in both ``reference`` and ``subset``.
+    """
+    filtered = State()
+    for key, sub_val in subset.items():
+        if key in reference:
+            ref_val = reference[key]
+            if isinstance(ref_val, State) and isinstance(sub_val, State):
+                filtered[key] = _filter_state_to_keys(ref_val, sub_val)
+            else:
+                filtered[key] = ref_val
+    return filtered
 
 
 class Module:
@@ -31,6 +52,7 @@ class Module:
     updates, splitting, and merging.
 
     Attributes:
+        _registries_initialized: Class-level sentinel flag overridden on instance creation.
         _children: Dictionary mapping child attribute names to child ``Module`` instances.
         _variables: Dictionary mapping variable names to ``Variable`` instances.
         _static_config: Dictionary mapping static configuration keys to metadata values.
@@ -39,6 +61,7 @@ class Module:
             new variable keys (enabled on dynamic containers such as ``Dict`` and ``List``).
     """
 
+    _registries_initialized: bool = False
     _children: dict[str, Module]
     _variables: dict[str, AnyVariable]
     _static_config: dict[str, MetadataValue]
@@ -56,17 +79,17 @@ class Module:
         self._static_config = dict(_kwargs)
         self._is_initializing = True
         self._allows_dynamic_variables = False
+        self._registries_initialized = True
 
     def _ensure_registries(self) -> None:
         """Ensure internal registries exist even if ``super().__init__()`` was not called first."""
-        try:
-            _ = self._variables
-        except AttributeError:
+        if not self._registries_initialized:
             self._children = {}
             self._variables = {}
             self._static_config = {}
             self._is_initializing = False
             self._allows_dynamic_variables = False
+            self._registries_initialized = True
 
     def register_variable(self, name: str, variable: VarT) -> VarT:
         """Register a stateful ``Variable`` (such as ``Param`` or ``BatchStat``) under ``name``.
@@ -148,7 +171,7 @@ class Module:
         Args:
             state: Primary ``State`` dictionary or sequence of ``State`` dictionaries.
             *more_states: Additional ``State`` dictionaries to merge and apply.
-            **kw_states: Additional key-value state entries to apply.
+            **kw_states: Additional key-value state entries to apply (supports ``strict_shapes=True``).
 
         Raises:
             KeyError: If a nested ``State`` key does not correspond to a registered child ``Module``,
@@ -169,10 +192,9 @@ class Module:
             if strict_flag is True:
                 from zero_chex import assert_trees_all_equal_shapes
 
-                from zero_flax.nnx.state import _state_to_chex_pytree
-
+                ref_subset = _filter_state_to_keys(self.state(), combined)
                 assert_trees_all_equal_shapes(
-                    _state_to_chex_pytree(self.state()),
+                    _state_to_chex_pytree(ref_subset),
                     _state_to_chex_pytree(combined),
                 )
 
@@ -274,6 +296,7 @@ class GraphDef(Generic[M]):
         target._static_config.update(self.static_fields)
         for child_name, child_def in self.children_defs.items():
             child_def._apply_graphdef_metadata(target._children[child_name])
+        target._on_state_updated()
 
     def merge(
         self,
@@ -454,6 +477,19 @@ def merge(
     return state_merge(*all_states)
 
 
+def clone(module: M) -> M:
+    """Return an independent deep clone of ``module`` via ``split`` and ``merge``.
+
+    Args:
+        module: Source ``Module`` instance to clone.
+
+    Returns:
+        Cloned ``Module`` instance with independent ``Variable`` containers.
+    """
+    graphdef, current_state = split(module)
+    return merge(graphdef, current_state)
+
+
 def state(module: Module) -> State:
     """Return the hierarchical ``State`` of ``module``.
 
@@ -525,6 +561,7 @@ __all__ = [
     "M",
     "Module",
     "VarT",
+    "clone",
     "iter_graph",
     "merge",
     "split",

@@ -55,3 +55,7 @@ def test_batch_norm() -> None:
     np.testing.assert_allclose(y, np.array([[-1.0, -1.0], [1.0, 1.0]], dtype=np.float32), atol=1e-5)
     y2 = np.asarray(b(x, use_running_average=True))
     assert y2.shape == x.shape
+    running_mean = np.asarray(b.mean.value)
+    running_var = np.asarray(b.var.value)
+    expected_y2 = (x - running_mean) / np.sqrt(running_var)
+    np.testing.assert_allclose(y2, expected_y2, rtol=1e-5, atol=1e-5)

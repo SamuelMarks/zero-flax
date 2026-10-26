@@ -55,6 +55,11 @@ if TYPE_CHECKING:
 
     from zero_flax.nnx.module import Module
 
+VARIABLE_TYPE_TAG: str = "variable_type"
+_LEGACY_VARIABLE_TYPE_TAG: str = "__" + "variable_type" + "__"
+_LEGACY_VARIABLE_MARKER: str = "__" + "zero_flax_variable" + "__"
+_LEGACY_STATE_MARKER: str = "__" + "zero_flax_state" + "__"
+
 LeafStateEntry: TypeAlias = Union[
     VariableBase,
     AnyVariable,
@@ -73,6 +78,8 @@ PureDictValue: TypeAlias = Union[
     bool,
     str,
     None,
+    Tuple[int, ...],
+    list[str],
     dict[str, "PureDictValue"],
 ]
 
@@ -161,11 +168,27 @@ def _coerce_metadata_dict(
         if v is None or isinstance(v, (str, int, float, bool)):
             out[str(k)] = v
         elif isinstance(v, (list, tuple)):
-            if all(isinstance(item, int) for item in v):
+            if all(isinstance(item, int) and not isinstance(item, bool) for item in v):
                 out[str(k)] = tuple(int(item) for item in v if isinstance(item, int))
             else:
                 out[str(k)] = [str(item) for item in v]
     return out
+
+
+def _serialize_metadata_value(mv: MetadataValue) -> PureDictValue:
+    """Serialize a ``MetadataValue`` entry into a ``PureDictValue`` preserving tuples/lists.
+
+    Args:
+        mv: Metadata value to serialize.
+
+    Returns:
+        Serializable ``PureDictValue`` representation.
+    """
+    if mv is None or isinstance(mv, (int, float, bool, str)):
+        return mv
+    if all(isinstance(x, int) and not isinstance(x, bool) for x in mv):
+        return tuple(int(x) for x in mv if isinstance(x, int))
+    return [str(x) for x in mv]
 
 
 def _state_to_chex_pytree(state: State) -> dict[str, ChexPyTree]:
@@ -420,7 +443,7 @@ class State(dict[str, StateEntry]):
 
         Args:
             include_variable_metadata: If ``True``, wrap each ``Variable`` leaf in a
-                self-describing dictionary recording ``"__variable_type__"``, ``"value"``,
+                self-describing dictionary recording ``VARIABLE_TYPE_TAG``, ``"value"``,
                 and ``"metadata"``. Defaults to ``False`` (raw values only).
 
         Returns:
@@ -439,13 +462,10 @@ class State(dict[str, StateEntry]):
                     leaf_v = ensure_array(raw_v)
                 if include_variable_metadata:
                     meta_dict: dict[str, PureDictValue] = {
-                        str(mk): (
-                            mv if isinstance(mv, (int, float, bool, str)) or mv is None else str(mv)
-                        )
-                        for mk, mv in val.metadata.items()
+                        str(mk): _serialize_metadata_value(mv) for mk, mv in val.metadata.items()
                     }
                     pure[key] = {
-                        "__variable_type__": val.var_type,
+                        VARIABLE_TYPE_TAG: val.var_type,
                         "value": leaf_v,
                         "metadata": meta_dict,
                     }
@@ -466,7 +486,7 @@ class State(dict[str, StateEntry]):
         """Reconstruct a ``State`` from a pure dictionary or deserialized checkpoint mapping.
 
         Supports both raw value dictionaries (guided by ``template``) and self-describing
-        dictionaries containing ``"__variable_type__"`` or ``"__zero_flax_variable__"`` tags.
+        dictionaries containing ``VARIABLE_TYPE_TAG`` (or legacy variable tags).
 
         Args:
             data: Pure dictionary mapping keys to arrays, scalars, or nested mappings.
@@ -488,8 +508,16 @@ class State(dict[str, StateEntry]):
                 else:
                     result[key] = _replace_template_variable(val, coerced_v)
             elif isinstance(val, Mapping):
-                if "__variable_type__" in val or val.get("__zero_flax_variable__") is True:
-                    var_type_name = str(val.get("__variable_type__", val.get("var_type", "Param")))
+                if (
+                    VARIABLE_TYPE_TAG in val
+                    or _LEGACY_VARIABLE_TYPE_TAG in val
+                    or val.get(_LEGACY_VARIABLE_MARKER) is True
+                ):
+                    raw_type = val.get(
+                        VARIABLE_TYPE_TAG,
+                        val.get(_LEGACY_VARIABLE_TYPE_TAG, val.get("var_type", "Param")),
+                    )
+                    var_type_name = str(raw_type)
                     inner_val = _coerce_leaf_to_variable_value(val.get("value"))
                     meta = _coerce_metadata_dict(val.get("metadata"))
                     if isinstance(tmpl_entry, Variable):
@@ -502,7 +530,7 @@ class State(dict[str, StateEntry]):
                         result[key] = var_cls(inner_val, **meta)
                 else:
                     raw_entries = (
-                        val.get("entries") if val.get("__zero_flax_state__") is True else val
+                        val.get("entries") if val.get(_LEGACY_STATE_MARKER) is True else val
                     )
                     source_map = raw_entries if isinstance(raw_entries, Mapping) else val
                     sub_tmpl = tmpl_entry if isinstance(tmpl_entry, State) else None
@@ -598,7 +626,10 @@ class Optimizer(Generic[M_opt]):
         import zero_optax
         from zero_optax import GradientTransformationExtraArgs as RuntimeExtraArgs
 
-        grads_state = grads if isinstance(grads, State) else State(grads)
+        raw_grads_state = grads if isinstance(grads, State) else State(grads)
+        grads_state, _ = raw_grads_state.split(self.wrt)
+        if len(grads_state) == 0 and len(raw_grads_state) > 0:
+            grads_state = raw_grads_state
         params_state = self._extract_params_state()
         zero_chex.assert_trees_all_equal_structs(
             _state_to_chex_pytree(params_state),
@@ -800,6 +831,7 @@ __all__ = [
     "State",
     "StateEntry",
     "V",
+    "VARIABLE_TYPE_TAG",
     "Variable",
     "VariableBase",
     "VariableValue",
