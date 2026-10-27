@@ -41,15 +41,16 @@ from zero_flax.types import (
 
 
 def _assert_axis_dimension(tensor: JaxArray, axis: int, expected: int) -> None:
-    """Validate that ``tensor`` has size ``expected`` along ``axis`` via ``zero_chex``.
+    """Validate that ``tensor`` has rank >= 1 and size ``expected`` along ``axis`` via ``zero_chex``.
 
     Args:
         tensor: Input ``JaxArray`` to validate.
         axis: Axis index to check.
         expected: Expected dimension size along ``axis``.
     """
-    from zero_chex.assertions import assert_axis_dimension
+    from zero_chex.assertions import assert_axis_dimension, assert_rank
 
+    assert_rank(tensor, tensor.ndim)
     assert_axis_dimension(tensor, axis, expected)
 
 
@@ -485,6 +486,7 @@ class LinearGeneral(Module):
                     f"LinearGeneral input dimension at axis {ax} ({x.shape[ax] if 0 <= ax < ndim else 'out of bounds'}) "
                     f"does not match expected in_features {expected_dim}."
                 )
+            _assert_axis_dimension(x, ax, expected_dim)
 
         dg: Optional[Union[DotGeneralProtocol, DotGeneralT]] = None
         if self.dot_general is not None:

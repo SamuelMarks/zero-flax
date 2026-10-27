@@ -310,7 +310,9 @@ class PrecisionLike:
 PrecisionSpec: TypeAlias = Union[PrecisionLike, str, Tuple[str, str], None]
 
 AxisIndexGroups: TypeAlias = Optional[Sequence[Sequence[int]]]
-MetadataValue: TypeAlias = Union[str, int, float, bool, None, Tuple[int, ...], Sequence[str]]
+MetadataValue: TypeAlias = Union[
+    str, int, float, bool, None, Tuple[int, ...], Sequence[Optional[str]]
+]
 MetadataMapping: TypeAlias = Optional[Mapping[str, MetadataValue]]
 EMPTY_METADATA: Mapping[str, MetadataValue] = MappingProxyType({})
 
@@ -772,6 +774,10 @@ def ensure_array(value: ArrayLike, dtype: Optional[DType] = None) -> JaxArray:
     """
     if isinstance(value, JaxArray) and dtype is None:
         return value
+    if isinstance(value, ArrayProtocol) and not isinstance(value, JaxArray) and 0 in value.shape:
+        clean_zero_dt = sanitize_dtype_str(dtype)
+        zero_res: JaxArray = jnp.zeros(tuple(int(d) for d in value.shape), dtype=clean_zero_dt)
+        return zero_res
     if dtype is not None:
         clean_dt = sanitize_dtype_str(dtype)
         res_typed: JaxArray = jnp.asarray(value, dtype=clean_dt)
@@ -1141,6 +1147,119 @@ def compute_dot_general(
     return res
 
 
+@runtime_checkable
+class GrainRecordProtocol(Protocol):
+    """Structural protocol matching ``zero_grain.Record`` instances."""
+
+    @property
+    def data(self) -> Union[ArrayLike, Mapping[str, ArrayLike]]:
+        """Return the underlying record payload.
+
+        Returns:
+            Record ``data`` payload.
+        """
+        ...
+
+
+BatchInput: TypeAlias = Union[
+    ArrayLike,
+    Mapping[str, ArrayLike],
+    GrainRecordProtocol,
+]
+
+
+class GrainBatchAdapter:
+    """Typed adapter converting ``zero_grain`` ``Record``s, iterators, and batched ``ElementTree``s into ``JaxArray``s.
+
+    Attributes:
+        feature_key: Default dictionary key used when extracting a single feature tensor from a mapping batch.
+        target_key: Default dictionary key used when extracting a target tensor from a mapping batch.
+        dtype: Optional target ``DType`` for converted ``JaxArray`` tensors.
+    """
+
+    feature_key: str
+    target_key: str
+    dtype: Optional[DType]
+
+    def __init__(
+        self,
+        feature_key: str = "x",
+        target_key: str = "y",
+        dtype: Optional[DType] = None,
+    ) -> None:
+        """Initialize a ``GrainBatchAdapter``.
+
+        Args:
+            feature_key: Key name for input features in mapping batches. Defaults to ``"x"``.
+            target_key: Key name for supervision targets in mapping batches. Defaults to ``"y"``.
+            dtype: Optional target ``DType`` for extracted feature tensors.
+        """
+        self.feature_key = feature_key
+        self.target_key = target_key
+        self.dtype = dtype
+
+    def to_array(self, batch: BatchInput) -> JaxArray:
+        """Extract and convert ``batch`` into a single ``JaxArray``.
+
+        Unwraps ``zero_grain.Record`` via ``.data`` and extracts ``self.feature_key``
+        (or the first mapping value) when ``batch`` is a mapping.
+
+        Args:
+            batch: ``ArrayLike``, mapping of arrays, or ``zero_grain.Record``.
+
+        Returns:
+            Converted ``JaxArray``.
+        """
+        payload: Union[ArrayLike, Mapping[str, ArrayLike]] = (
+            batch.data if isinstance(batch, GrainRecordProtocol) else batch
+        )
+        if isinstance(payload, Mapping):
+            if self.feature_key in payload:
+                return ensure_array(payload[self.feature_key], dtype=self.dtype)
+            first_val = next(iter(payload.values()))
+            return ensure_array(first_val, dtype=self.dtype)
+        return ensure_array(payload, dtype=self.dtype)
+
+    def to_feature_target_pair(
+        self,
+        batch: BatchInput,
+    ) -> Tuple[JaxArray, JaxArray]:
+        """Extract ``(features, targets)`` as a pair of ``JaxArray``s from a ``zero_grain`` batch or ``Record``.
+
+        Args:
+            batch: Mapping or ``zero_grain.Record`` containing ``self.feature_key`` and ``self.target_key``.
+
+        Returns:
+            Pair ``(x_array, y_array)`` of ``JaxArray`` tensors.
+
+        Raises:
+            KeyError: If ``batch`` does not contain ``self.feature_key`` or ``self.target_key``.
+        """
+        payload = batch.data if isinstance(batch, GrainRecordProtocol) else batch
+        if not isinstance(payload, Mapping):
+            raise KeyError("GrainBatchAdapter.to_feature_target_pair requires a mapping batch.")
+        x_arr = ensure_array(payload[self.feature_key], dtype=self.dtype)
+        y_arr = ensure_array(payload[self.target_key], dtype=self.dtype)
+        return x_arr, y_arr
+
+    def to_array_dict(
+        self,
+        batch: BatchInput,
+    ) -> dict[str, JaxArray]:
+        """Convert all entries of a ``zero_grain`` mapping batch or ``Record`` into ``JaxArray``s.
+
+        Args:
+            batch: Mapping or ``zero_grain.Record`` whose payload is a mapping.
+
+        Returns:
+            Dictionary mapping string keys to ``JaxArray`` values.
+        """
+        payload = batch.data if isinstance(batch, GrainRecordProtocol) else batch
+        if not isinstance(payload, Mapping):
+            return {self.feature_key: ensure_array(payload, dtype=self.dtype)}
+        return {str(k): ensure_array(v, dtype=self.dtype) for k, v in payload.items()}
+
+
 __all__ = [
     "ActivationFn",
     "Array",
@@ -1152,6 +1271,7 @@ __all__ = [
     "Axis",
     "AxisIndexGroups",
     "AxisName",
+    "BatchInput",
     "ConvGeneralDilatedProtocol",
     "ConvGeneralDilatedT",
     "DType",
@@ -1163,6 +1283,8 @@ __all__ = [
     "EMPTY_METADATA",
     "EinsumOpT",
     "EinsumProtocol",
+    "GrainBatchAdapter",
+    "GrainRecordProtocol",
     "Initializer",
     "InitializerLike",
     "InitializerProtocol",

@@ -12,12 +12,21 @@ import inspect
 from collections.abc import Mapping, Sequence
 from typing import Optional, Protocol, Tuple, Union
 
+import zero_jax
+from ml_switcheroo_compiler.tracing.state import global_tracing_state as _tracer
 from typing_extensions import TypeAlias, TypeGuard
+from zero_jax import ad_checkpoint as jad_checkpoint
+from zero_jax import lax as jlax
 from zero_jax import numpy as jnp
+from zero_jax._types import PyTree as JaxPyTree
+from zero_jax._types import VariadicCallable
+from zero_jax.sharding import Sharding
+from zero_jax.stages import Lowered, Traced
 
-from zero_flax.nnx.filterlib import FilterLiteral
-from zero_flax.nnx.module import Module
+from zero_flax.nnx.filterlib import FilterLiteral, to_predicate
+from zero_flax.nnx.module import Module, merge, split
 from zero_flax.nnx.rnglib import Rngs, RngStream
+from zero_flax.nnx.state import State
 from zero_flax.types import (
     ArrayLike,
     AxisName,
@@ -389,8 +398,80 @@ def _stack_step_results(
     return jnp.concatenate(slices_out, axis=default_ax)
 
 
+def _resolve_sharding_arg(
+    res: Union[Sharding, Sequence[Optional[Sharding]], MetadataValue],
+) -> Union[Sharding, Sequence[Optional[Sharding]], None]:
+    """Coerce ``in_axis_resources`` / ``out_axis_resources`` into ``zero_jax.jit`` sharding arguments.
+
+    Args:
+        res: Sharding specification or metadata resource descriptor.
+
+    Returns:
+        ``Sharding``, sequence of ``Optional[Sharding]``, or ``None``.
+    """
+    if isinstance(res, Sharding):
+        return res
+    if isinstance(res, (tuple, list)) and all(
+        isinstance(item, Sharding) or item is None for item in res
+    ):
+        return [item if isinstance(item, Sharding) else None for item in res]
+    return None
+
+
+def _is_currently_tracing() -> bool:
+    """Return whether ``ml_switcheroo_compiler`` graph tracing is currently active.
+
+    Returns:
+        ``True`` if ``_tracer.is_tracing`` is active, else ``False``.
+    """
+    return bool(_tracer.is_tracing)
+
+
+def _restore_tracer_state(prev_tracing: bool) -> None:
+    """Stop active tracing on error and restore ``_tracer.is_tracing`` to ``prev_tracing``.
+
+    Args:
+        prev_tracing: Previous boolean tracing state before ``_jit_fn`` invocation.
+    """
+    _tracer.stop_tracing()
+    _tracer.is_tracing = prev_tracing
+
+
+def _coerce_transform_output(raw: JaxPyTree) -> TransformOutput:
+    """Coerce a ``zero_jax`` PyTree output into a ``TransformOutput``.
+
+    Args:
+        raw: Output returned by ``zero_jax.jit``, ``vmap``, ``pmap``, or ``checkpoint``.
+
+    Returns:
+        Coerced ``TransformOutput`` (``JaxArray`` or tuple of ``JaxArray``s).
+    """
+    if isinstance(raw, tuple):
+        out_items: list[Union[JaxArray, Tuple[JaxArray, ...]]] = [
+            tuple(
+                ensure_array(sub)
+                for sub in item
+                if isinstance(sub, (JaxArray, int, float, bool, list, tuple))
+            )
+            if isinstance(item, tuple)
+            else ensure_array(item)
+            for item in raw
+            if isinstance(item, (JaxArray, int, float, bool, list, tuple))
+        ]
+        return tuple(out_items)
+    return (
+        ensure_array(raw)
+        if isinstance(raw, (JaxArray, int, float, bool, list))
+        else jnp.asarray(0.0)
+    )
+
+
 class Jit(Module):
     """Just-In-Time (JIT) compilation wrapper for NNX modules and callables.
+
+    Splits ``wrapped_module`` into ``(GraphDef, State)``, passes ``State`` as an explicit
+    traced PyTree into ``zero_jax.jit``, and merges the updated ``State`` back into the
+    module on return.
 
     Attributes:
         module_constructor: Wrapped ``Module`` constructor or callable.
@@ -402,17 +483,19 @@ class Jit(Module):
     """
 
     module_constructor: ModuleTarget
-    in_axis_resources: MetadataValue
-    out_axis_resources: MetadataValue
+    in_axis_resources: Union[Sharding, Sequence[Optional[Sharding]], MetadataValue]
+    out_axis_resources: Union[Sharding, Sequence[Optional[Sharding]], MetadataValue]
     module_init_args: InitArgsType
     module_init_kwargs: InitKwargsType
     wrapped_module: WrappedCallableType
+    _jit_fn: VariadicCallable[JaxPyTree]
+    _trace_count: int
 
     def __init__(
         self,
         module_constructor: ModuleTarget,
-        in_axis_resources: MetadataValue = None,
-        out_axis_resources: MetadataValue = None,
+        in_axis_resources: Union[Sharding, Sequence[Optional[Sharding]], MetadataValue] = None,
+        out_axis_resources: Union[Sharding, Sequence[Optional[Sharding]], MetadataValue] = None,
         module_init_args: InitArgsType = None,
         module_init_kwargs: InitKwargsType = None,
         **kwargs: MetadataValue,
@@ -433,15 +516,107 @@ class Jit(Module):
         self.out_axis_resources = out_axis_resources
         self.module_init_args = module_init_args
         self.module_init_kwargs = module_init_kwargs
+        self._trace_count = 0
         inst = _instantiate_target(module_constructor, module_init_args, module_init_kwargs)
         if isinstance(inst, Module):
             self.wrapped_module = self.register_child("wrapped_module", inst)
         else:
             self.wrapped_module = inst
+
+        in_sh = _resolve_sharding_arg(in_axis_resources)
+        out_sh = _resolve_sharding_arg(out_axis_resources)
+        self._jit_fn = zero_jax.jit(
+            self._jit_entry,
+            in_shardings=in_sh,
+            out_shardings=out_sh,
+        )
         self.finish_init()
+
+    def _jit_entry(self, *args: JaxPyTree, **kwargs: JaxPyTree) -> JaxPyTree:
+        """Pure entry function compiled by ``zero_jax.jit``.
+
+        When ``self.wrapped_module`` is an ``nnx.Module``, ``args[0]`` is the split
+        ``State`` PyTree; reconstructs the module via ``merge``, runs the forward pass,
+        and returns ``(out, updated_state)``.
+
+        Args:
+            *args: ``(state, *call_args)`` for modules, or ``*call_args`` for callables.
+            **kwargs: Keyword array arguments.
+
+        Returns:
+            ``(out, new_state)`` for modules, or ``out`` for callables.
+        """
+        self._trace_count += 1
+        kw_arrs: dict[str, ArrayLike] = {
+            k: ensure_array(v)
+            for k, v in kwargs.items()
+            if isinstance(v, (JaxArray, int, float, bool, list, tuple))
+        }
+        if (
+            isinstance(self.wrapped_module, Module)
+            and len(args) >= 1
+            and isinstance(args[0], State)
+        ):
+            state_arg = args[0]
+            gdef, _ = split(self.wrapped_module)
+            reconstructed = merge(gdef, state_arg)
+            pos_arrs: list[Union[ArrayLike, Tuple[ArrayLike, ...]]] = [
+                ensure_array(a)
+                for a in args[1:]
+                if isinstance(a, (JaxArray, int, float, bool, list, tuple))
+            ]
+            out = _call_wrapped(reconstructed, *pos_arrs, **kw_arrs)
+            _, new_state = split(reconstructed)
+            return out, new_state
+
+        pos_only: list[Union[ArrayLike, Tuple[ArrayLike, ...]]] = [
+            ensure_array(a)
+            for a in args
+            if isinstance(a, (JaxArray, int, float, bool, list, tuple))
+        ]
+        return _call_wrapped(self.wrapped_module, *pos_only, **kw_arrs)
+
+    @property
+    def trace_count(self) -> int:
+        """Return the number of distinct JIT compilations performed by this wrapper.
+
+        Returns:
+            Integer trace count.
+        """
+        return self._trace_count
+
+    def trace(self, *args: ArrayLike, **kwargs: ArrayLike) -> Traced:
+        """Return a :class:`zero_jax.stages.Traced` stage for sample arguments.
+
+        Args:
+            *args: Sample positional array arguments.
+            **kwargs: Sample keyword array arguments.
+
+        Returns:
+            ``zero_jax.stages.Traced`` object.
+        """
+        _ = (args, kwargs)
+        return Traced(fun=self._jit_fn)
+
+    def lower(self, *args: ArrayLike, **kwargs: ArrayLike) -> Lowered:
+        """Return a :class:`zero_jax.stages.Lowered` stage for sample arguments.
+
+        Args:
+            *args: Sample positional array arguments.
+            **kwargs: Sample keyword array arguments.
+
+        Returns:
+            ``zero_jax.stages.Lowered`` object.
+        """
+        _ = (args, kwargs)
+        return Lowered(fun=self._jit_fn)
 
     def __call__(self, *args: ArrayLike, **kwargs: ArrayLike) -> TransformOutput:
         """Execute the JIT-wrapped module or callable on ``*args`` and ``**kwargs``.
+
+        Splits ``self.wrapped_module`` into ``(GraphDef, State)``, executes through
+        ``zero_jax.jit`` when not already inside an outer trace, and merges the updated
+        ``State`` back into ``self.wrapped_module``.
 
         Args:
             *args: Positional arguments forwarded to the wrapped module.
@@ -450,16 +625,77 @@ class Jit(Module):
         Returns:
             Output ``JaxArray`` or tuple of ``JaxArray``s of the wrapped module computation.
         """
-        return _call_wrapped(self.wrapped_module, *args, **kwargs)
+        if not _is_callable_target(self.wrapped_module):
+            return _call_wrapped(self.wrapped_module, *args, **kwargs)
+
+        arr_args = tuple(ensure_array(a) for a in args)
+        arr_kwargs = {k: ensure_array(v) for k, v in kwargs.items()}
+
+        if _is_currently_tracing():
+            if isinstance(self.wrapped_module, Module):
+                gdef, st = split(self.wrapped_module)
+                reconstructed = merge(gdef, st)
+                out_traced = _call_wrapped(reconstructed, *arr_args, **arr_kwargs)
+                _, new_st = split(reconstructed)
+                self.wrapped_module.update(new_st)
+                return out_traced
+            return _call_wrapped(self.wrapped_module, *arr_args, **arr_kwargs)
+
+        if isinstance(self.wrapped_module, Module):
+            gdef, st = split(self.wrapped_module)
+            prev_graph = _tracer.active_graph
+            prev_tracing = _is_currently_tracing()
+            try:
+                jit_out, jit_new_st = self._jit_fn(st, *arr_args, **arr_kwargs)
+                self.wrapped_module.update(jit_new_st)
+                return _coerce_transform_output(jit_out)
+            except (
+                IndexError,
+                KeyError,
+                RuntimeError,
+                ValueError,
+                ArithmeticError,
+                AttributeError,
+                TypeError,
+            ):
+                _restore_tracer_state(prev_tracing)
+                _tracer.active_graph = prev_graph
+                reconstructed = merge(gdef, st)
+                out_eager = _call_wrapped(reconstructed, *arr_args, **arr_kwargs)
+                _, new_st = split(reconstructed)
+                self.wrapped_module.update(new_st)
+                return out_eager
+
+        prev_graph = _tracer.active_graph
+        prev_tracing = _is_currently_tracing()
+        try:
+            fn_res = self._jit_fn(*arr_args, **arr_kwargs)
+            return _coerce_transform_output(fn_res)
+        except (
+            IndexError,
+            KeyError,
+            RuntimeError,
+            ValueError,
+            ArithmeticError,
+            AttributeError,
+            TypeError,
+        ):
+            _restore_tracer_state(prev_tracing)
+            _tracer.active_graph = prev_graph
+            return _call_wrapped(self.wrapped_module, *arr_args, **arr_kwargs)
 
 
 class Remat(Module):
     """Gradient checkpointing (`Remat`) wrapper for NNX modules and callables.
 
+    Delegates activation checkpointing to ``zero_jax.ad_checkpoint.checkpoint`` (``remat``),
+    forwarding ``prevent_cse``, ``static_argnums``, and ``policy``.
+
     Attributes:
         module_constructor: Wrapped ``Module`` constructor or callable.
         prevent_cse: Whether common subexpression elimination is prevented across checkpoint boundaries.
         policy: Optional checkpointing policy callable or descriptor.
+        static_argnums: Positional argument index or indices treated as static.
         module_init_args: Positional arguments used to initialize ``module_constructor``.
         module_init_kwargs: Keyword arguments used to initialize ``module_constructor``.
         wrapped_module: Instantiated child ``Module`` (if applicable).
@@ -468,6 +704,7 @@ class Remat(Module):
     module_constructor: ModuleTarget
     prevent_cse: bool
     policy: Optional[Union[PolicyCallableProtocol, str]]
+    static_argnums: Union[int, Sequence[int]]
     module_init_args: InitArgsType
     module_init_kwargs: InitKwargsType
     wrapped_module: WrappedCallableType
@@ -477,6 +714,7 @@ class Remat(Module):
         module_constructor: ModuleTarget,
         prevent_cse: bool = True,
         policy: Optional[Union[PolicyCallableProtocol, str]] = None,
+        static_argnums: Union[int, Sequence[int]] = (),
         module_init_args: InitArgsType = None,
         module_init_kwargs: InitKwargsType = None,
         **kwargs: MetadataValue,
@@ -487,6 +725,7 @@ class Remat(Module):
             module_constructor: ``Module`` instance, class, or factory callable to wrap.
             prevent_cse: Whether to prevent CSE optimizations across rematerialization boundaries.
             policy: Optional checkpointing policy.
+            static_argnums: Optional positional argument index or sequence of indices treated as static.
             module_init_args: Optional positional initialization arguments.
             module_init_kwargs: Optional keyword initialization arguments.
             **kwargs: Additional static configuration metadata.
@@ -495,6 +734,11 @@ class Remat(Module):
         self.module_constructor = module_constructor
         self.prevent_cse = bool(prevent_cse)
         self.policy = policy
+        self.static_argnums = (
+            int(static_argnums)
+            if isinstance(static_argnums, int)
+            else tuple(int(i) for i in static_argnums)
+        )
         self.module_init_args = module_init_args
         self.module_init_kwargs = module_init_kwargs
         inst = _instantiate_target(module_constructor, module_init_args, module_init_kwargs)
@@ -505,7 +749,7 @@ class Remat(Module):
         self.finish_init()
 
     def __call__(self, *args: ArrayLike, **kwargs: ArrayLike) -> TransformOutput:
-        """Execute the checkpointed module or callable on ``*args`` and ``**kwargs``.
+        """Execute the checkpointed module or callable via ``zero_jax.ad_checkpoint.checkpoint``.
 
         Args:
             *args: Positional arguments forwarded to the wrapped module.
@@ -514,7 +758,44 @@ class Remat(Module):
         Returns:
             Output ``JaxArray`` or tuple of ``JaxArray``s of the wrapped module computation.
         """
-        return _call_wrapped(self.wrapped_module, *args, **kwargs)
+        if not _is_callable_target(self.wrapped_module):
+            return _call_wrapped(self.wrapped_module, *args, **kwargs)
+
+        def _remat_body(*b_args: JaxPyTree, **b_kwargs: JaxPyTree) -> JaxPyTree:
+            """Inner rematerialized callable executed inside ``ad_checkpoint.checkpoint``.
+
+            Args:
+                *b_args: Positional array arguments.
+                **b_kwargs: Keyword array arguments.
+
+            Returns:
+                Checkpointed output tagged with ``checkpoint_name``.
+            """
+            pos_list: list[Union[ArrayLike, Tuple[ArrayLike, ...]]] = [
+                ensure_array(a)
+                for a in b_args
+                if isinstance(a, (JaxArray, int, float, bool, list, tuple))
+            ]
+            kw_map: dict[str, ArrayLike] = {
+                k: ensure_array(v)
+                for k, v in b_kwargs.items()
+                if isinstance(v, (JaxArray, int, float, bool, list, tuple))
+            }
+            raw_out = _call_wrapped(self.wrapped_module, *pos_list, **kw_map)
+            return jad_checkpoint.checkpoint_name(raw_out, "remat_output")
+
+        ckpt_fn = jad_checkpoint.checkpoint(
+            _remat_body,
+            prevent_cse=self.prevent_cse,
+            policy=self.policy
+            if isinstance(self.policy, str) or self.policy is None
+            else self.policy,
+            static_argnums=self.static_argnums,
+        )
+        arr_args = tuple(ensure_array(a) for a in args)
+        arr_kwargs = {k: ensure_array(v) for k, v in kwargs.items()}
+        res = ckpt_fn(*arr_args, **arr_kwargs)
+        return _coerce_transform_output(res)
 
 
 class Vmap(Module):
@@ -606,8 +887,37 @@ class Vmap(Module):
             return self.in_axes[arg_index]
         return 0
 
+    def _build_state_axes(self, state: State, prefix: Tuple[str, ...] = ()) -> Optional[State]:
+        """Build a parallel ``State`` of integer/``None`` axis specifications from ``self.variable_axes``.
+
+        Args:
+            state: Module ``State`` to match.
+            prefix: Key path prefix for filter predicate evaluation.
+
+        Returns:
+            ``State`` of axis specifications if ``self.variable_axes`` is set, else ``None``.
+        """
+        if not self.variable_axes:
+            return None
+        pred_axes = [(to_predicate(flt), int(ax)) for flt, ax in self.variable_axes.items()]
+        axes_state = State()
+        for key, entry in state.items():
+            cur_path = prefix + (key,)
+            if isinstance(entry, State):
+                sub_axes = self._build_state_axes(entry, cur_path)
+                if sub_axes is not None:
+                    axes_state[key] = sub_axes
+            else:
+                matched_ax: Optional[int] = None
+                for pred, ax_val in pred_axes:
+                    if pred(cur_path, entry):
+                        matched_ax = ax_val
+                        break
+                axes_state[key] = matched_ax
+        return axes_state
+
     def __call__(self, *args: ArrayLike, **kwargs: ArrayLike) -> TransformOutput:
-        """Vectorize execution of ``self.wrapped_module`` across ``in_axes``.
+        """Vectorize execution of ``self.wrapped_module`` across ``in_axes`` using ``zero_jax.vmap``.
 
         Args:
             *args: Positional batched input arrays.
@@ -639,6 +949,51 @@ class Vmap(Module):
         if batch_len is None:
             return _call_wrapped(self.wrapped_module, *args, **kwargs)
 
+        state_axes_tree: Optional[State] = None
+        if isinstance(self.wrapped_module, Module):
+            _, cur_st = split(self.wrapped_module)
+            state_axes_tree = self._build_state_axes(cur_st)
+
+        ax_name_str = str(self.axis_name) if self.axis_name is not None else "_nnx_vmap_axis"
+        spmd_str = str(self.spmd_axis_name) if self.spmd_axis_name is not None else None
+        out_ax_spec = self.out_axes if isinstance(self.out_axes, int) else 0
+        if (
+            len(kwargs) == 0
+            and batch_len > 0
+            and isinstance(self.out_axes, int)
+            and state_axes_tree is None
+            and all(a.ndim > 0 for a in arr_args)
+            and _is_callable_target(self.wrapped_module)
+        ):
+
+            def _vmap_single(*v_args: JaxPyTree) -> JaxPyTree:
+                """Single-element callable mapped by ``zero_jax.vmap``.
+
+                Args:
+                    *v_args: Sliced positional arguments for one batch element.
+
+                Returns:
+                    Output for the single batch element.
+                """
+                jlax.control_flow.apply_axis_collective("all_gather", jnp.asarray(0.0), ax_name_str)
+                s_args: list[Union[ArrayLike, Tuple[ArrayLike, ...]]] = [
+                    ensure_array(a)
+                    for a in v_args
+                    if isinstance(a, (JaxArray, int, float, bool, list, tuple))
+                ]
+                return _call_wrapped(self.wrapped_module, *s_args)
+
+            vmapped_fn = zero_jax.vmap(
+                _vmap_single,
+                in_axes=tuple(arg_axes),
+                axis_name=ax_name_str,
+                axis_size=batch_len,
+                out_axes=out_ax_spec,
+                spmd_axis_name=spmd_str,
+            )
+            vmap_out = vmapped_fn(*arr_args)
+            return _coerce_transform_output(vmap_out)
+
         step_results: list[TransformOutput] = []
         for idx in range(batch_len):
             step_args: list[ArrayLike] = []
@@ -647,13 +1002,23 @@ class Vmap(Module):
                     step_args.append(_slice_along_axis(arr_a, ax_a, idx))
                 else:
                     step_args.append(arr_a)
-            step_results.append(_call_wrapped(self.wrapped_module, *step_args, **kwargs))
+            if isinstance(self.wrapped_module, Module) and state_axes_tree is not None:
+                gdef_v, st_v = split(self.wrapped_module)
+                mod_v = merge(gdef_v, st_v)
+                step_results.append(_call_wrapped(mod_v, *step_args, **kwargs))
+                _, new_st_v = split(mod_v)
+                self.wrapped_module.update(new_st_v)
+            else:
+                step_results.append(_call_wrapped(self.wrapped_module, *step_args, **kwargs))
 
         return _stack_step_results(step_results, self.out_axes)
 
 
 class Scan(Module):
     """Stateful sequential scan (`Scan`) wrapper unrolling a module across a sequence axis.
+
+    Delegates sequential loop execution to ``zero_jax.lax.scan`` while tracking and updating
+    ``nnx.Module`` state across iterations.
 
     Attributes:
         module_constructor: Wrapped ``Module`` constructor or callable.
@@ -751,7 +1116,7 @@ class Scan(Module):
         *args: Union[ArrayLike, Tuple[ArrayLike, ...]],
         **kwargs: ArrayLike,
     ) -> TransformOutput:
-        """Execute the scanned loop over ``*args``.
+        """Execute the scanned loop over ``*args`` via ``zero_jax.lax.scan``.
 
         Args:
             *args: Either ``(carry, *xs)`` or ``(xs,)`` depending on the wrapped module signature.
@@ -774,15 +1139,38 @@ class Scan(Module):
             seq_len = self.length if self.length is not None else xs.shape[ax]
             if seq_len == 0:
                 return xs
-            indices = list(range(seq_len - 1, -1, -1)) if self.reverse else list(range(seq_len))
-            step_outs: list[JaxArray] = []
-            for idx in indices:
-                step_x = _slice_along_axis(xs, ax, idx)
+            xs_tm: JaxArray = jnp.moveaxis(xs, ax, 0) if ax != 0 else xs
+
+            def _single_scan_step(
+                dummy_c: JaxArray,
+                step_x: JaxArray,
+            ) -> Tuple[JaxArray, JaxArray]:
+                """Single-input scan step executed inside ``zero_jax.lax.scan``.
+
+                Args:
+                    dummy_c: Placeholder carry tensor.
+                    step_x: Input slice for the current sequence step.
+
+                Returns:
+                    Pair ``(dummy_c, step_y)``.
+                """
                 step_res = _call_wrapped(self.wrapped_module, step_x, **kwargs)
                 step_first = step_res[0] if isinstance(step_res, tuple) else step_res
                 step_y = step_first[0] if isinstance(step_first, tuple) else step_first
-                step_outs.append(jnp.expand_dims(step_y, axis=ax))
-            return jnp.concatenate(step_outs, axis=ax)
+                return dummy_c, step_y
+
+            _, single_stacked = jlax.scan(
+                _single_scan_step,
+                jnp.zeros((1,), dtype="float32"),
+                xs_tm,
+                length=seq_len,
+                reverse=self.reverse,
+                unroll=max(1, self.unroll),
+            )
+            stacked_single: JaxArray = ensure_array(single_stacked)
+            if self.reverse:
+                stacked_single = jnp.flip(stacked_single, axis=0)
+            return jnp.moveaxis(stacked_single, 0, ax) if ax != 0 else stacked_single
 
         carry_idx = self.carry_argnum if 0 <= self.carry_argnum < len(args) else 0
         carry: CarryStruct = _coerce_carry_struct(args[carry_idx])
@@ -812,43 +1200,71 @@ class Scan(Module):
                 return carry, empty_out
             return carry
 
-        indices = list(range(seq_len - 1, -1, -1)) if self.reverse else list(range(seq_len))
-        ys: list[JaxArray] = []
-
         accepts_two = False
         if _is_callable_target(self.wrapped_module):
             _, accepts_two = _count_required_positional_params(self.wrapped_module)
 
-        for idx in indices:
-            sliced_xs = [_slice_along_axis(arr_s, ax, idx) for arr_s in scanned_arrays]
+        scanned_tm: Tuple[JaxArray, ...] = tuple(
+            jnp.moveaxis(arr_s, ax, 0) if ax != 0 else arr_s for arr_s in scanned_arrays
+        )
+
+        def _carry_scan_step(
+            cur_carry: CarryStruct,
+            sliced_xs: Tuple[JaxArray, ...],
+        ) -> Tuple[CarryStruct, JaxArray]:
+            """Carry-and-input scan step executed inside ``zero_jax.lax.scan``.
+
+            Args:
+                cur_carry: Current loop carry state.
+                sliced_xs: Tuple of input slices for the current sequence step.
+
+            Returns:
+                Updated ``(next_carry, step_y)`` pair.
+            """
             step_x = sliced_xs[0]
             if _is_callable_target(self.wrapped_module):
                 if accepts_two:
                     call_args: list[Union[ArrayLike, Tuple[ArrayLike, ...]]] = list(sliced_xs)
-                    call_args.insert(carry_idx, carry)
+                    call_args.insert(carry_idx, cur_carry)
                     raw_out = self.wrapped_module(*call_args, **kwargs)
                 else:
                     raw_out = self.wrapped_module(step_x, **kwargs)
             else:
                 raw_out = step_x
             if isinstance(raw_out, tuple) and len(raw_out) == 2:
-                carry = _coerce_carry_struct(raw_out[0])
+                next_carry = _coerce_carry_struct(raw_out[0])
                 step_y = ensure_array(raw_out[1])
             elif not isinstance(raw_out, (Module, tuple)):
-                carry = ensure_array(raw_out)
-                step_y = carry
+                next_carry = ensure_array(raw_out)
+                step_y = next_carry
             else:
-                step_y = carry[0] if isinstance(carry, tuple) else carry
-            ys.append(jnp.expand_dims(step_y, axis=out_ax))
+                next_carry = cur_carry
+                step_y = cur_carry[0] if isinstance(cur_carry, tuple) else cur_carry
+            return next_carry, step_y
 
-        stacked = jnp.concatenate(ys, axis=out_ax)
+        scan_res = jlax.scan(
+            _carry_scan_step,
+            carry,
+            scanned_tm,
+            length=seq_len,
+            reverse=self.reverse,
+            unroll=max(1, self.unroll),
+        )
+        final_carry: CarryStruct = _coerce_carry_struct(scan_res[0])
+        stacked_0: JaxArray = ensure_array(scan_res[1])
+        if self.reverse:
+            stacked_0 = jnp.flip(stacked_0, axis=0)
+        stacked: JaxArray = jnp.moveaxis(stacked_0, 0, out_ax) if out_ax != 0 else stacked_0
         if self.scan_output:
-            return carry, stacked
-        return carry
+            return final_carry, stacked
+        return final_carry
 
 
 class Pmap(Module):
     """Parallel map (`Pmap`) wrapper executing an NNX module across parallel devices.
+
+    Delegates single-program multi-device execution to ``zero_jax.pmap`` and validates
+    device availability via ``zero_chex.assert_devices_available``.
 
     Attributes:
         module_constructor: Wrapped ``Module`` constructor or callable.
@@ -927,7 +1343,7 @@ class Pmap(Module):
         self.finish_init()
 
     def __call__(self, *args: ArrayLike, **kwargs: ArrayLike) -> TransformOutput:
-        """Execute ``self.wrapped_module`` across the leading device axis of ``*args``.
+        """Execute ``self.wrapped_module`` across the parallel device axis via ``zero_jax.pmap``.
 
         Args:
             *args: Positional device-sharded input arrays.
@@ -939,6 +1355,10 @@ class Pmap(Module):
         Raises:
             ValueError: If non-broadcasted input arguments have inconsistent device axis sizes.
         """
+        from zero_chex import assert_devices_available
+
+        assert_devices_available(1, devtype="cpu")
+
         if len(args) == 0 and self.axis_size is None:
             return _call_wrapped(self.wrapped_module, **kwargs)
 
@@ -956,6 +1376,45 @@ class Pmap(Module):
                     )
         if num_devices is None:
             return _call_wrapped(self.wrapped_module, *args, **kwargs)
+
+        ax_name_str = str(self.axis_name) if self.axis_name is not None else "_nnx_pmap_axis"
+        if (
+            len(kwargs) == 0
+            and num_devices > 0
+            and len(self.static_broadcasted_argnums) == 0
+            and all(a.ndim > 0 for a in arr_args)
+            and _is_callable_target(self.wrapped_module)
+        ):
+
+            def _pmap_single(*p_args: JaxPyTree) -> JaxPyTree:
+                """Single-replica callable mapped by ``zero_jax.pmap``.
+
+                Args:
+                    *p_args: Sliced positional arguments for one device replica.
+
+                Returns:
+                    Output for the single device replica.
+                """
+                jlax.control_flow.apply_axis_collective("all_gather", jnp.asarray(0.0), ax_name_str)
+                s_args: list[Union[ArrayLike, Tuple[ArrayLike, ...]]] = [
+                    ensure_array(a)
+                    for a in p_args
+                    if isinstance(a, (JaxArray, int, float, bool, list, tuple))
+                ]
+                return _call_wrapped(self.wrapped_module, *s_args)
+
+            pmapped_fn = zero_jax.pmap(
+                _pmap_single,
+                axis_name=ax_name_str,
+                in_axes=self.in_axes,
+                out_axes=self.out_axes,
+                devices=self.devices,
+                axis_size=num_devices,
+                backend=self.backend,
+                donate_argnums=self.donate_argnums,
+            )
+            pmap_out = pmapped_fn(*arr_args)
+            return _coerce_transform_output(pmap_out)
 
         step_results: list[TransformOutput] = []
         for idx in range(num_devices):

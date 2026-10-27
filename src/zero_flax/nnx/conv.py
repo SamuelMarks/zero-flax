@@ -42,17 +42,25 @@ from zero_flax.types import (
 )
 
 
-def _assert_conv_rank_and_channels(x: JaxArray, expected_channels: int) -> None:
-    """Validate spatial rank and trailing channel dimension of ``x`` via ``zero_chex``.
+def _assert_conv_rank_and_channels(
+    x: JaxArray,
+    expected_channels: int,
+    kernel: JaxArray,
+    num_spatial: int,
+) -> None:
+    """Validate spatial rank, kernel rank, and trailing channel dimension of ``x`` via ``zero_chex``.
 
     Args:
         x: Input ``JaxArray`` tensor.
         expected_channels: Expected size of the last channel axis.
+        kernel: Convolution kernel ``JaxArray``.
+        num_spatial: Number of spatial filter dimensions.
     """
     from zero_chex.assertions import assert_axis_dimension, assert_rank
 
     assert_rank(x, x.ndim)
     assert_axis_dimension(x, -1, expected_channels)
+    assert_rank(kernel, num_spatial + 2)
 
 
 def _compute_spatial_padding(
@@ -453,7 +461,7 @@ class Conv(Module):
                 f"Conv input channel dimension ({x.shape[-1]}) does not match "
                 f"in_features ({self.in_features})."
             )
-        _assert_conv_rank_and_channels(x, self.in_features)
+        _assert_conv_rank_and_channels(x, self.in_features, k, num_spatial)
 
         if self.conv_general_dilated is not None:
             custom_out = ensure_array(self.conv_general_dilated(x, k))
@@ -699,7 +707,7 @@ class ConvTranspose(Module):
                 f"ConvTranspose input channel dimension ({x.shape[-1]}) does not match "
                 f"in_features ({self.in_features})."
             )
-        _assert_conv_rank_and_channels(x, self.in_features)
+        _assert_conv_rank_and_channels(x, self.in_features, k, num_spatial)
 
         if self.transpose_kernel:
             flip_slices = tuple(slice(None, None, -1) for _ in range(num_spatial)) + (
@@ -839,7 +847,10 @@ class Embed(Module):
         Returns:
             Embedded ``JaxArray`` of shape ``(*inputs.shape, features)``.
         """
+        from zero_chex.assertions import assert_type
+
         idx = ensure_array(inputs, dtype="int32")
+        assert_type(idx, int)
         table = ensure_array(self.embedding.value, dtype=self.dtype)
         if self.promote_dtype is not None:
             table = self.promote_dtype(table, dtype=self.dtype)[0]

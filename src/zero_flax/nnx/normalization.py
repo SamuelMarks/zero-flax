@@ -78,17 +78,22 @@ def _normalize_axes(axes: Union[Axes, int, Sequence[int], None], ndim: int) -> T
     return tuple(a if a >= 0 else max(0, ndim + a) for a in raw)
 
 
-def _assert_feature_dim(tensor: JaxArray, axis: int, expected: int) -> None:
-    """Validate that ``tensor`` has size ``expected`` along ``axis`` via ``zero_chex``.
+def _assert_feature_dim(
+    tensor: JaxArray,
+    axis: int,
+    expected: int,
+) -> None:
+    """Validate that ``tensor`` has size ``expected`` along ``axis`` and finite values via ``zero_chex``.
 
     Args:
         tensor: Input ``JaxArray`` to validate.
         axis: Axis index to check.
         expected: Expected dimension size along ``axis``.
     """
-    from zero_chex.assertions import assert_axis_dimension
+    from zero_chex import assert_axis_dimension, assert_trees_all_finite
 
     assert_axis_dimension(tensor, axis, expected)
+    assert_trees_all_finite(tensor)
 
 
 def _aggregate_moments_across_devices(

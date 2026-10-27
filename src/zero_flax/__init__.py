@@ -11,6 +11,7 @@ import os
 
 os.environ.setdefault("SWITCHEROO_EAGER_MODE", "1")
 
+from zero_flax import core as core
 from zero_flax import nnx as nnx
 from zero_flax import types as types
 
@@ -28,4 +29,4 @@ def enable_eager_mode(enabled: bool = True) -> None:
     os.environ["SWITCHEROO_EAGER_MODE"] = "1" if enabled else "0"
 
 
-__all__ = ["__version__", "enable_eager_mode", "nnx", "types"]
+__all__ = ["__version__", "core", "enable_eager_mode", "nnx", "types"]

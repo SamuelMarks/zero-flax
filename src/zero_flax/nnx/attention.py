@@ -169,6 +169,11 @@ def dot_product_attention(
         v_b = v
         squeeze_batch = False
 
+    from zero_chex.assertions import assert_axis_dimension, assert_equal_rank
+
+    assert_equal_rank([q_b, k_b, v_b])
+    assert_axis_dimension(k_b, -1, int(q_b.shape[-1]))
+
     num_q_heads = q_b.shape[-2]
     num_kv_heads = k_b.shape[-2]
     if num_q_heads != num_kv_heads and num_kv_heads > 0 and num_q_heads % num_kv_heads == 0:

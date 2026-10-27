@@ -12,6 +12,8 @@ import copy
 from collections.abc import Iterator, Sequence
 from typing import Generic, Optional, Tuple, TypeVar, Union, overload
 
+from zero_jax import tree_util as jax_tree_util
+
 from zero_flax.nnx.filterlib import FilterLiteral
 from zero_flax.nnx.state import State, StateEntry, _state_to_chex_pytree
 from zero_flax.nnx.state import merge as state_merge
@@ -185,15 +187,25 @@ class Module:
             combined = state_merge(combined, *state)
         for extra in more_states:
             combined = state_merge(combined, extra)
+        strict_flag = False
         if kw_states:
-            strict_flag = kw_states.pop("strict_shapes", False)
+            raw_strict = kw_states.pop("strict_shapes", False)
+            strict_flag = raw_strict is True
             if kw_states:
                 combined = state_merge(combined, State(kw_states))
-            if strict_flag is True:
-                from zero_chex import assert_trees_all_equal_shapes
+        if len(combined) > 0:
+            import zero_chex
 
-                ref_subset = _filter_state_to_keys(self.state(), combined)
-                assert_trees_all_equal_shapes(
+            current_state = self.state()
+            ref_subset = _filter_state_to_keys(current_state, combined)
+            comb_subset = _filter_state_to_keys(combined, ref_subset)
+            if len(ref_subset) > 0:
+                zero_chex.assert_trees_all_equal_structs(
+                    _state_to_chex_pytree(ref_subset),
+                    _state_to_chex_pytree(comb_subset),
+                )
+            if strict_flag:
+                zero_chex.assert_trees_all_equal_shapes(
                     _state_to_chex_pytree(ref_subset),
                     _state_to_chex_pytree(combined),
                 )
@@ -320,6 +332,9 @@ class GraphDef(Generic[M]):
             combined = state_merge(*state, *more_states)
         reconstructed.update(combined)
         return reconstructed
+
+
+jax_tree_util.register_static(GraphDef)
 
 
 @overload

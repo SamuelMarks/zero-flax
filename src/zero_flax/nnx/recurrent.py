@@ -11,6 +11,7 @@ from collections.abc import Callable, Mapping, Sequence
 from typing import Optional, Tuple, Union
 
 from typing_extensions import TypeAlias
+from zero_jax import lax as jlax
 from zero_jax import numpy as jnp
 
 from zero_flax.nnx.filterlib import FilterLiteral
@@ -1087,6 +1088,12 @@ class RNN(Module):
         time_axis = 0 if tm else 1
         seq_len = x.shape[time_axis]
         step_shape = (*x.shape[1:],) if tm else (x.shape[0], *x.shape[2:])
+        if initial_carry is not None:
+            from zero_chex import assert_equal_shape_prefix
+
+            batch_ref = x[0] if tm else x[:, 0]
+            carry_ref = initial_carry[0] if isinstance(initial_carry, tuple) else initial_carry
+            assert_equal_shape_prefix([batch_ref, carry_ref], 1)
         carry: CarryType = (
             initial_carry
             if initial_carry is not None
@@ -1108,29 +1115,49 @@ class RNN(Module):
         seq_len_arr: Optional[JaxArray] = (
             ensure_array(seq_lengths, dtype="int32") if seq_lengths is not None else None
         )
-        indices = list(range(seq_len - 1, -1, -1)) if rev else list(range(seq_len))
-        outputs: list[JaxArray] = []
-        for t_idx in indices:
-            step_x = x[t_idx] if tm else x[:, t_idx]
-            prev_carry = carry
-            next_carry, step_y = self.cell(carry, step_x)
+        x_tm: JaxArray = x if tm else jnp.swapaxes(x, 0, 1)
+        t_indices: JaxArray = jnp.arange(seq_len, dtype="int32")
+
+        def _scan_step(
+            cur_carry: CarryType,
+            step_inputs: Tuple[JaxArray, JaxArray],
+        ) -> Tuple[CarryType, JaxArray]:
+            """Execute a single recurrent cell step inside ``zero_jax.lax.scan``.
+
+            Args:
+                cur_carry: Current recurrent carry state.
+                step_inputs: Pair ``(step_x, t_idx)`` for the current time step.
+
+            Returns:
+                Updated ``(next_carry, step_y)`` pair.
+            """
+            step_x, t_idx = step_inputs
+            next_carry, step_y = self.cell(cur_carry, step_x)
             if seq_len_arr is not None:
                 valid_mask = jnp.reshape(
                     t_idx < seq_len_arr,
                     (-1,) + (1,) * max(0, step_y.ndim - 1),
                 )
-                carry = _select_masked_carry(valid_mask, next_carry, prev_carry)
-                step_y = jnp.where(valid_mask, step_y, jnp.zeros_like(step_y))
-            else:
-                carry = next_carry
-            outputs.append(jnp.expand_dims(step_y, axis=time_axis))
+                masked_carry = _select_masked_carry(valid_mask, next_carry, cur_carry)
+                masked_y: JaxArray = jnp.where(valid_mask, step_y, jnp.zeros_like(step_y))
+                return masked_carry, masked_y
+            return next_carry, step_y
 
-        if rev and ko:
-            outputs.reverse()
-
-        stacked: JaxArray = jnp.concatenate(outputs, axis=time_axis)
+        scan_out = jlax.scan(
+            _scan_step,
+            carry,
+            (x_tm, t_indices),
+            length=seq_len,
+            reverse=rev,
+            unroll=max(1, self.unroll),
+        )
+        final_carry: CarryType = scan_out[0]
+        stacked_tm: JaxArray = ensure_array(scan_out[1])
+        if rev and not ko:
+            stacked_tm = jnp.flip(stacked_tm, axis=0)
+        stacked: JaxArray = stacked_tm if tm else jnp.swapaxes(stacked_tm, 0, 1)
         if ret_c:
-            return carry, stacked
+            return final_carry, stacked
         return stacked
 
 
@@ -1226,6 +1253,18 @@ class Bidirectional(Module):
         bwd_ko = self.backward_rnn.keep_order if keep_order is None else bool(keep_order)
         fwd_init_c = initial_carry[0] if initial_carry is not None else None
         bwd_init_c = initial_carry[1] if initial_carry is not None else None
+        if initial_carry is not None:
+            from zero_chex import assert_equal_shape_prefix
+
+            x_arr = ensure_array(inputs)
+            batch_ref = x_arr[0] if tm else x_arr[:, 0]
+            fwd_ref = (
+                initial_carry[0][0] if isinstance(initial_carry[0], tuple) else initial_carry[0]
+            )
+            bwd_ref = (
+                initial_carry[1][0] if isinstance(initial_carry[1], tuple) else initial_carry[1]
+            )
+            assert_equal_shape_prefix([batch_ref, fwd_ref, bwd_ref], 1)
 
         fwd_res = self.forward_rnn(
             inputs,

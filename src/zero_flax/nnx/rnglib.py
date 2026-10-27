@@ -122,6 +122,64 @@ class RngStream(Module):
             return reshaped
         return next_key
 
+    def random(self) -> float:
+        """Draw a deterministic uniform floating-point number in ``[0.0, 1.0)``.
+
+        Returns:
+            Sampled float in ``[0.0, 1.0)``.
+        """
+        key = self()
+        val: JaxArray = jrandom.uniform(key, shape=(), minval=0.0, maxval=1.0)
+        return float(jnp.asarray(val).item())
+
+    def uniform(self, low: float = 0.0, high: float = 1.0) -> float:
+        """Draw a deterministic uniform floating-point number in ``[low, high)``.
+
+        Args:
+            low: Lower bound of the interval. Defaults to ``0.0``.
+            high: Upper bound of the interval. Defaults to ``1.0``.
+
+        Returns:
+            Sampled float in ``[low, high)``.
+        """
+        key = self()
+        val: JaxArray = jrandom.uniform(key, shape=(), minval=float(low), maxval=float(high))
+        return float(jnp.asarray(val).item())
+
+    def integers(self, low: int, high: Optional[int] = None) -> int:
+        """Draw a deterministic integer from ``[0, low)`` or ``[low, high)``.
+
+        Args:
+            low: Inclusive lower bound (or exclusive upper bound if ``high`` is ``None``).
+            high: Optional exclusive upper bound.
+
+        Returns:
+            Sampled integer.
+        """
+        lo = 0 if high is None else int(low)
+        hi = int(low) if high is None else int(high)
+        if hi <= lo:
+            return lo
+        key = self()
+        val: JaxArray = jrandom.randint(key, shape=(), minval=lo, maxval=hi)
+        return int(jnp.asarray(val).item())
+
+    def permutation(self, x: Union[int, Sequence[int]]) -> list[int]:
+        """Return a deterministically permuted list of integers using this stream.
+
+        Args:
+            x: Upper bound integer ``n`` (permuting ``range(n)``) or sequence of integers.
+
+        Returns:
+            Permuted ``list[int]``.
+        """
+        items = list(range(int(x))) if isinstance(x, int) else [int(v) for v in x]
+        n = len(items)
+        for i in range(n - 1, 0, -1):
+            j = self.integers(0, i + 1)
+            items[i], items[j] = items[j], items[i]
+        return items
+
 
 class Rngs(Module):
     """Collection of named `RngStream` instances for parameter initialization, dropout, and carry generation.
@@ -274,6 +332,61 @@ class Rngs(Module):
             else next(iter(self._streams.values()))
         )
         return first_stream.fork(split=split)
+
+    def _active_rng_stream(self) -> RngStream:
+        """Return the primary ``RngStream`` for ``RNGGeneratorProtocol`` operations.
+
+        Returns:
+            The ``"default"`` stream if present, otherwise the first registered stream.
+        """
+        return (
+            self._streams["default"]
+            if "default" in self._streams
+            else next(iter(self._streams.values()))
+        )
+
+    def random(self) -> float:
+        """Draw a deterministic uniform floating-point number in ``[0.0, 1.0)``.
+
+        Returns:
+            Sampled float in ``[0.0, 1.0)``.
+        """
+        return self._active_rng_stream().random()
+
+    def uniform(self, low: float = 0.0, high: float = 1.0) -> float:
+        """Draw a deterministic uniform floating-point number in ``[low, high)``.
+
+        Args:
+            low: Lower bound of the interval. Defaults to ``0.0``.
+            high: Upper bound of the interval. Defaults to ``1.0``.
+
+        Returns:
+            Sampled float in ``[low, high)``.
+        """
+        return self._active_rng_stream().uniform(low=low, high=high)
+
+    def integers(self, low: int, high: Optional[int] = None) -> int:
+        """Draw a deterministic integer from ``[0, low)`` or ``[low, high)``.
+
+        Args:
+            low: Inclusive lower bound (or exclusive upper bound if ``high`` is ``None``).
+            high: Optional exclusive upper bound.
+
+        Returns:
+            Sampled integer.
+        """
+        return self._active_rng_stream().integers(low, high)
+
+    def permutation(self, x: Union[int, Sequence[int]]) -> list[int]:
+        """Return a deterministically permuted list of integers using the active stream.
+
+        Args:
+            x: Upper bound integer ``n`` (permuting ``range(n)``) or sequence of integers.
+
+        Returns:
+            Permuted ``list[int]``.
+        """
+        return self._active_rng_stream().permutation(x)
 
 
 def resolve_rng_key(

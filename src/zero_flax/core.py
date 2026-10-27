@@ -8,10 +8,15 @@ without duplicate stub classes or `object` annotations.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Iterator, Mapping
-from typing import Tuple, TypeVar, Union
+from collections.abc import Iterable, Iterator, Mapping, Sequence
+from typing import TYPE_CHECKING, Tuple, TypeVar, Union
 
 from typing_extensions import TypeAlias
+from zero_jax import tree_util as jax_tree_util
+from zero_jax._types import ArrayLikeSpec as JaxArrayLikeSpec
+
+if TYPE_CHECKING:
+    from zero_chex.types import PyTree as ChexPyTree
 
 from zero_flax.nnx import (
     RNN,
@@ -233,6 +238,111 @@ class FrozenDict(Mapping[str, FrozenEntry]):
             Formatted ``"FrozenDict(...)"`` string.
         """
         return f"FrozenDict({self._data!r})"
+
+    def chex_mappable_fields(self) -> tuple[str, ...]:
+        """Return the sorted tuple of keys in this ``FrozenDict`` for ``zero_chex`` and ``zero_optax``.
+
+        Returns:
+            Sorted tuple of dictionary keys.
+        """
+        return tuple(sorted(self._data.keys()))
+
+    def chex_field_values(self) -> tuple[FrozenEntry, ...]:
+        """Return the tuple of values corresponding to sorted keys for ``zero_chex`` and ``zero_optax``.
+
+        Returns:
+            Tuple of ``FrozenEntry`` values in sorted key order.
+        """
+        return tuple(self._data[k] for k in sorted(self._data.keys()))
+
+    if TYPE_CHECKING:
+
+        def __chex_mappable_fields__(self) -> tuple[str, ...]:
+            """Return the sorted tuple of keys in this ``FrozenDict`` for static protocol checks.
+
+            Returns:
+                Sorted tuple of dictionary keys.
+            """
+            return tuple(sorted(self._data.keys()))
+
+        def __chex_field_values__(self) -> tuple[FrozenEntry, ...]:
+            """Return the tuple of values corresponding to sorted keys for static protocol checks.
+
+            Returns:
+                Tuple of ``FrozenEntry`` values in sorted key order.
+            """
+            return tuple(self._data[k] for k in sorted(self._data.keys()))
+
+    def tree_flatten_with_keys(
+        self,
+    ) -> tuple[list[tuple[jax_tree_util.DictKey, FrozenEntry]], tuple[str, ...]]:
+        """Flatten this ``FrozenDict`` with ``DictKey`` entries for ``zero_jax.tree_util``.
+
+        Returns:
+            Pair ``(key_value_pairs, sorted_keys_tuple)``.
+        """
+        keys = tuple(sorted(self._data.keys()))
+        return ([(jax_tree_util.DictKey(k), self._data[k]) for k in keys], keys)
+
+    def tree_flatten(self) -> tuple[list[FrozenEntry], tuple[str, ...]]:
+        """Flatten this ``FrozenDict`` into a list of values and sorted key tuple for ``zero_jax.tree_util``.
+
+        Returns:
+            Pair ``(children_values, sorted_keys_tuple)``.
+        """
+        keys = tuple(sorted(self._data.keys()))
+        return ([self._data[k] for k in keys], keys)
+
+    @classmethod
+    def tree_unflatten(
+        cls,
+        aux: JaxArrayLikeSpec,
+        children: Sequence[JaxArrayLikeSpec],
+    ) -> FrozenDict:
+        """Reconstruct a ``FrozenDict`` from ``aux`` sorted keys and ``children`` values.
+
+        Args:
+            aux: Tuple of sorted string keys.
+            children: Sequence of child values.
+
+        Returns:
+            Reconstructed ``FrozenDict`` instance.
+        """
+        keys = tuple(str(k) for k in aux) if isinstance(aux, (tuple, list)) else ()
+        return cls({k: _coerce_frozendict_child(v) for k, v in zip(keys, children)})
+
+
+def _coerce_frozendict_child(val: Union[JaxArrayLikeSpec, ChexPyTree, FrozenEntry]) -> FrozenEntry:
+    """Coerce a flattened PyTree child back into a valid ``FrozenEntry``.
+
+    Args:
+        val: Candidate child value from ``zero_jax.tree_util`` or ``zero_chex``.
+
+    Returns:
+        Coerced ``FrozenEntry``.
+    """
+    if (
+        isinstance(val, (FrozenDict, VariableBase))
+        or val is None
+        or isinstance(val, (int, float, bool, str))
+    ):
+        return val
+    if isinstance(val, Mapping):
+        return FrozenDict({str(k): _coerce_frozendict_child(v) for k, v in val.items()})
+    from zero_flax.types import JaxArray, ensure_array
+
+    if isinstance(val, JaxArray):
+        return val
+    return ensure_array(val) if isinstance(val, (list, tuple)) else None
+
+
+def register_frozendict_pytree() -> type[FrozenDict]:
+    """Return ``FrozenDict``, which implements ``_TreeFlattenWithKeysProtocol`` for ``zero_jax.tree_util``.
+
+    Returns:
+        The ``FrozenDict`` class.
+    """
+    return FrozenDict
 
 
 def freeze(xs: Mapping[str, FrozenEntry]) -> FrozenDict:

@@ -9,12 +9,14 @@ and `OptState`) without `Any`, `object`, or reflection.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from typing import TYPE_CHECKING, Generic, Optional, Tuple, TypeVar, Union
 
 from ml_switcheroo_compiler.core.tensor import Tensor
 from typing_extensions import TypeAlias
 from zero_jax import numpy as jnp
+from zero_jax import tree_util as jax_tree_util
+from zero_jax._types import ArrayLikeSpec as JaxArrayLikeSpec
 
 from zero_flax.nnx.filterlib import Filter, FilterLiteral, FilterTarget, to_predicate
 from zero_flax.nnx.variables import (
@@ -369,6 +371,8 @@ class State(dict[str, StateEntry]):
     def to_optax_tree(self) -> dict[str, OptaxPyTree]:
         """Convert this ``State`` into a nested dictionary of ``zero_optax`` ``Tensor`` leaves.
 
+        Uses zero-copy ``JaxArray`` -> ``Tensor`` wrapping without ``.tolist()`` serialization.
+
         Returns:
             Nested dictionary mapping state keys to ``ml_switcheroo_compiler.core.tensor.Tensor``
             or scalar leaves suitable for ``zero_optax`` transformations.
@@ -388,13 +392,13 @@ class State(dict[str, StateEntry]):
                 elif isinstance(raw_v, str):
                     tree[key] = 0.0
                 else:
-                    tree[key] = optax_asarray(ensure_array(raw_v).tolist())
+                    tree[key] = optax_asarray(ensure_array(raw_v))
             elif val is None or isinstance(val, (int, float, bool)):
                 tree[key] = val if val is None else optax_asarray(val)
             elif isinstance(val, str):
                 tree[key] = 0.0
             else:
-                tree[key] = optax_asarray(ensure_array(val).tolist())
+                tree[key] = optax_asarray(ensure_array(val))
         return tree
 
     @classmethod
@@ -543,6 +547,117 @@ class State(dict[str, StateEntry]):
                     result[key] = Param(coerced_leaf)
         return result
 
+    def to_chex_tree(self) -> dict[str, ChexPyTree]:
+        """Convert this ``State`` into a ``zero_chex``-compatible nested dictionary of arrays/scalars.
+
+        Returns:
+            Nested dictionary with unwrapped array/scalar leaves for ``zero_chex`` assertions.
+        """
+        return _state_to_chex_pytree(self)
+
+    def chex_mappable_fields(self) -> tuple[str, ...]:
+        """Return the sorted tuple of keys in this ``State`` for ``zero_chex`` and ``zero_optax``.
+
+        Returns:
+            Sorted tuple of state keys.
+        """
+        return tuple(sorted(self.keys()))
+
+    def chex_field_values(self) -> tuple[StateEntry, ...]:
+        """Return the tuple of values corresponding to sorted keys for ``zero_chex`` and ``zero_optax``.
+
+        Returns:
+            Tuple of ``StateEntry`` values in sorted key order.
+        """
+        return tuple(self[k] for k in sorted(self.keys()))
+
+    if TYPE_CHECKING:
+
+        def __chex_mappable_fields__(self) -> tuple[str, ...]:
+            """Return the sorted tuple of keys in this ``State`` for static protocol checks.
+
+            Returns:
+                Sorted tuple of state keys.
+            """
+            return tuple(sorted(self.keys()))
+
+        def __chex_field_values__(self) -> tuple[StateEntry, ...]:
+            """Return the tuple of values corresponding to sorted keys for static protocol checks.
+
+            Returns:
+                Tuple of ``StateEntry`` values in sorted key order.
+            """
+            return tuple(self[k] for k in sorted(self.keys()))
+
+    def tree_flatten_with_keys(
+        self,
+    ) -> tuple[list[tuple[jax_tree_util.DictKey, StateEntry]], tuple[str, ...]]:
+        """Flatten this ``State`` with ``DictKey`` entries for ``zero_jax.tree_util``.
+
+        Returns:
+            Pair ``(key_value_pairs, sorted_keys_tuple)``.
+        """
+        keys = tuple(sorted(self.keys()))
+        return ([(jax_tree_util.DictKey(k), self[k]) for k in keys], keys)
+
+    def tree_flatten(self) -> tuple[list[StateEntry], tuple[str, ...]]:
+        """Flatten this ``State`` into a list of values and sorted key tuple for ``zero_jax.tree_util``.
+
+        Returns:
+            Pair ``(children_values, sorted_keys_tuple)``.
+        """
+        keys = tuple(sorted(self.keys()))
+        return ([self[k] for k in keys], keys)
+
+    @classmethod
+    def tree_unflatten(
+        cls,
+        aux: JaxArrayLikeSpec,
+        children: Sequence[JaxArrayLikeSpec],
+    ) -> State:
+        """Reconstruct a ``State`` from ``aux`` sorted keys and ``children`` values.
+
+        Args:
+            aux: Tuple of sorted string keys.
+            children: Sequence of child values.
+
+        Returns:
+            Reconstructed ``State`` instance.
+        """
+        keys = tuple(str(k) for k in aux) if isinstance(aux, (tuple, list)) else ()
+        return cls({k: _coerce_state_child(v) for k, v in zip(keys, children)})
+
+
+def _coerce_state_child(
+    val: Union[JaxArrayLikeSpec, ChexPyTree, StateEntry],
+) -> StateEntry:
+    """Coerce a flattened PyTree child back into a valid ``StateEntry``.
+
+    Args:
+        val: Candidate child value from ``zero_jax.tree_util`` or ``zero_chex``.
+
+    Returns:
+        Coerced ``StateEntry`` (converting nested non-State dicts into ``State``).
+    """
+    if (
+        isinstance(val, (State, VariableBase))
+        or val is None
+        or isinstance(val, (int, float, bool, str))
+    ):
+        return val
+    if isinstance(val, Mapping):
+        return State({str(k): _coerce_state_child(v) for k, v in val.items()})
+    return _coerce_leaf_to_variable_value(val)
+
+
+def register_state_pytree() -> type[State]:
+    """Return ``State``, which implements ``_TreeFlattenWithKeysProtocol`` for ``zero_jax.tree_util``.
+
+    Returns:
+        The ``State`` class.
+    """
+    return State
+
 
 M_opt = TypeVar("M_opt", bound="Module")
 
@@ -594,7 +709,7 @@ class Optimizer(Generic[M_opt]):
         self.step = OptState(jnp.array(0, dtype="int32"))
         filtered_params = self._extract_params_state()
         self.opt_variable = OptVariable(filtered_params)
-        self.opt_state = self.tx.init(filtered_params.to_optax_tree())
+        self.opt_state = self.tx.init(filtered_params)
 
     def _extract_params_state(self) -> State:
         """Extract the subset of ``self.model.state()`` matching ``self.wrt``.
@@ -606,6 +721,22 @@ class Optimizer(Generic[M_opt]):
         matched, _ = full_state.split(self.wrt)
         return matched
 
+    def get_hyperparam(self, key: str) -> Optional[JaxArray]:
+        """Retrieve a scheduled or injected hyperparameter from ``self.opt_state`` via ``zero_optax.tree_utils.tree_get``.
+
+        Args:
+            key: Hyperparameter name (e.g., ``"learning_rate"``, ``"gradient_step"``).
+
+        Returns:
+            ``JaxArray`` value of the hyperparameter if found in ``self.opt_state``, else ``None``.
+        """
+        from zero_optax.tree_utils import tree_get
+
+        found = tree_get(self.opt_state, key)
+        return (
+            ensure_array(found) if isinstance(found, (JaxArray, Tensor, int, float, bool)) else None
+        )
+
     def update(
         self,
         grads: Union[State, Mapping[str, StateEntry]],
@@ -613,10 +744,10 @@ class Optimizer(Generic[M_opt]):
     ) -> None:
         """Apply one optimization step to ``self.model`` using ``grads`` and ``self.tx``.
 
-        Validates that ``grads`` matches the structure and tensor shapes of the filtered
-        model parameters via ``zero_chex.assert_trees_all_equal_shapes``, transforms
-        ``grads`` via ``self.tx.update``, applies the updates via ``zero_optax.apply_updates``,
-        updates ``self.model`` in-place, and increments ``self.step``.
+        Validates that ``grads`` matches the structure, shapes, and dtypes of the filtered
+        model parameters via ``zero_chex.assert_trees_all_equal_shapes_and_dtypes``, transforms
+        ``grads`` via ``self.tx.update`` directly on ``State``, applies the updates via
+        ``zero_optax.apply_updates``, updates ``self.model`` in-place, and increments ``self.step``.
 
         Args:
             grads: Gradient ``State`` (or nested mapping) matching the filtered parameters of ``self.model``.
@@ -639,26 +770,34 @@ class Optimizer(Generic[M_opt]):
             _state_to_chex_pytree(params_state),
             _state_to_chex_pytree(grads_state),
         )
+        aligned_grads = State.from_optax_tree(grads_state, template=params_state)
+        zero_chex.assert_trees_all_equal_shapes_and_dtypes(
+            _state_to_chex_pytree(params_state),
+            _state_to_chex_pytree(aligned_grads),
+        )
 
-        params_optax = params_state.to_optax_tree()
-        grads_optax = grads_state.to_optax_tree()
         if isinstance(self.tx, RuntimeExtraArgs) and extra_args:
             updates_optax, new_opt_state = self.tx.update(
-                grads_optax,
+                aligned_grads,
                 self.opt_state,
-                params_optax,
+                params_state,
                 **extra_args,
             )
         else:
             updates_optax, new_opt_state = self.tx.update(
-                grads_optax,
+                aligned_grads,
                 self.opt_state,
-                params_optax,
+                params_state,
             )
-        new_params_optax = zero_optax.apply_updates(params_optax, updates_optax)
+        aligned_updates = (
+            State.from_optax_tree(updates_optax, template=params_state)
+            if isinstance(updates_optax, (State, Mapping))
+            else params_state
+        )
+        new_params_optax = zero_optax.apply_updates(params_state, aligned_updates)
         updated_state = (
             State.from_optax_tree(new_params_optax, template=params_state)
-            if isinstance(new_params_optax, Mapping)
+            if isinstance(new_params_optax, (State, Mapping))
             else params_state
         )
         self.model.update(updated_state)
@@ -714,45 +853,84 @@ class Optimizer(Generic[M_opt]):
             self.opt_state = opt_state_from_state_dict(self.opt_state, raw_opt_state)
 
 
+if TYPE_CHECKING:
+    from zero_orbax.types import GrainIteratorProtocol
+
+GrainIteratorType: TypeAlias = "GrainIteratorProtocol"
+
+
 def save_state(
     directory: PathLike,
     state: State,
     *,
     force: bool = True,
+    optimizer: Optional[Optimizer[M_opt]] = None,
+    dataloader_iterator: Optional[GrainIteratorType] = None,
 ) -> bool:
-    """Save an ``nnx.State`` to ``directory`` using ``zero_orbax.checkpoint.PyTreeCheckpointer``.
+    """Save an ``nnx.State`` (and optional ``Optimizer`` and ``zero_grain`` iterator) to ``directory``.
+
+    When ``optimizer`` or ``dataloader_iterator`` is provided, uses
+    ``zero_orbax.checkpoint.CompositeCheckpointHandler`` and ``zero_grain.PyGrainCheckpointSave``
+    to persist a composite training checkpoint; otherwise uses ``PyTreeCheckpointer``.
 
     Args:
         directory: Target local path or virtual URI (e.g., ``"memory://ckpt"``).
         state: ``State`` container to serialize.
         force: Whether to overwrite an existing checkpoint directory. Defaults to ``True``.
+        optimizer: Optional ``nnx.Optimizer`` whose ``state_dict()`` should be saved alongside ``state``.
+        dataloader_iterator: Optional ``zero_grain`` ``DataLoaderIterator`` or ``DatasetIterator`` to checkpoint.
 
     Returns:
         ``True`` when the checkpoint has been committed.
     """
+    import shutil
+    from pathlib import Path
+
     import zero_orbax.checkpoint as ocp
 
-    checkpointer = ocp.PyTreeCheckpointer()
-    checkpointer.save(
-        directory,
-        state.to_pure_dict(include_variable_metadata=True),
-        force=force,
-    )
+    if optimizer is None and dataloader_iterator is None:
+        checkpointer = ocp.PyTreeCheckpointer()
+        checkpointer.save(
+            directory,
+            state.to_pure_dict(include_variable_metadata=True),
+            force=force,
+        )
+        return True
+
+    p = Path(str(directory))
+    if force and p.exists():
+        shutil.rmtree(p)
+
+    composite_items: dict[str, OrbaxPyTree] = {
+        "state": state.to_pure_dict(include_variable_metadata=True),
+    }
+    if optimizer is not None:
+        composite_items["optimizer"] = optimizer.state_dict()
+    if dataloader_iterator is not None:
+        composite_items["dataloader"] = dataloader_iterator
+
+    comp_handler = ocp.CompositeCheckpointHandler(*composite_items.keys())
+    comp_handler.save(directory, item=composite_items)
     return True
 
 
 def restore_state(
     directory: PathLike,
     target: Optional[State] = None,
+    *,
+    optimizer: Optional[Optimizer[M_opt]] = None,
+    dataloader_iterator: Optional[GrainIteratorType] = None,
 ) -> State:
-    """Restore an ``nnx.State`` from ``directory`` using ``zero_orbax.checkpoint.PyTreeCheckpointer``.
+    """Restore an ``nnx.State`` (and optional ``Optimizer`` and ``zero_grain`` iterator) from ``directory``.
 
     Validates structural and shape equality against ``target`` via ``zero_chex`` when
     ``target`` is provided.
 
     Args:
         directory: Source local path or virtual URI (e.g., ``"memory://ckpt"``).
-        target: Optional reference ``State`` template to guide restoration and update in-place.
+        target: Optional reference ``State`` template to guide restoration.
+        optimizer: Optional ``nnx.Optimizer`` to restore in-place from a composite checkpoint.
+        dataloader_iterator: Optional ``zero_grain`` iterator to restore in-place from a composite checkpoint.
 
     Returns:
         Restored ``State`` instance.
@@ -760,11 +938,39 @@ def restore_state(
     import zero_chex
     import zero_orbax.checkpoint as ocp
 
-    checkpointer = ocp.PyTreeCheckpointer()
-    target_item = (
+    target_item: Optional[dict[str, PureDictValue]] = (
         target.to_pure_dict(include_variable_metadata=True) if target is not None else None
     )
-    restored = checkpointer.restore(directory, item=target_item)
+    restored: Union[OrbaxPyTree, State, None]
+    if optimizer is not None or dataloader_iterator is not None:
+        composite_restore: dict[str, OrbaxPyTree] = {
+            "state": target_item,
+        }
+        if optimizer is not None:
+            composite_restore["optimizer"] = optimizer.state_dict()
+        if dataloader_iterator is not None:
+            composite_restore["dataloader"] = dataloader_iterator
+
+        comp_handler = ocp.CompositeCheckpointHandler(*composite_restore.keys())
+        comp_restored = comp_handler.restore(directory, item=composite_restore)
+        raw_state = (
+            comp_restored["state"]
+            if isinstance(comp_restored, Mapping) and "state" in comp_restored
+            else comp_restored
+        )
+        opt_payload = (
+            comp_restored.get("optimizer")
+            if optimizer is not None and isinstance(comp_restored, Mapping)
+            else None
+        )
+        if optimizer is not None and isinstance(opt_payload, Mapping):
+            optimizer.load_state_dict(opt_payload)
+        restored = raw_state if isinstance(raw_state, (State, Mapping)) else None
+    else:
+        checkpointer = ocp.PyTreeCheckpointer()
+        raw_ckpt = checkpointer.restore(directory, item=target_item)
+        restored = raw_ckpt if isinstance(raw_ckpt, (State, Mapping)) else None
+
     result_state = (
         restored
         if isinstance(restored, State)
